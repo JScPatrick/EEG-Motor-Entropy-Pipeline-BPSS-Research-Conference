@@ -1,0 +1,1666 @@
+# * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+# EEG Motor Entropy Pipeline (Made for EEGMMIDB [PhysioNet] data)
+#
+# Main conditions: Rest, Motor Imagery, and Motor Execution (movement)
+#
+# The pipeline includes multiple entropy measures:
+#  - Sample Entropy (SampEn)
+#  - Multiscale Entropy (MSE)
+#  - Permutation Entropy (PermEn)
+# Pipeline also calculates Power spectral density (PSD) using the fast Fourier transform (FFT) to compute band power
+# - Can compute absolute or relative band power
+#
+# More Features of Pipeline
+# - Computes average sample entropy and band power for each electrode across subjects
+# - Produces CSV tables and figures of results (such as average sample entropy and multiscale entropy across subjects)
+# - Whole-scalp analysis, with an option to restrict analyses to sensorimotor + context ROI electrodes.
+# - Can also conduct antropy validation (requires pip install antropy)
+#
+# You may choose to not compute several of the mentioned measures in the configurations (set to True or False)
+# - You also have the option to compute entropy per epoch (recommended)
+#   or average epochs first and then compute entropy (faster computation time but more prone to inaccuracy)
+#
+# REQUIRED: Python 3.10+, mne, numpy, pandas, scipy, matplotlib, tqdm; optional joblib, antropy
+#
+# Set DATASET_ROOT (below) before running; this is where the code will pull the data from
+# * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+
+
+import os
+import re
+import math
+import warnings
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from scipy.stats import ttest_rel
+
+import mne
+
+# Optional: pip install antropy — fast SampEn (recommended) + optional validation CSV
+try:
+    from antropy import sample_entropy as _antropy_sample_entropy  # type: ignore
+except ImportError:
+    _antropy_sample_entropy = None
+
+try:
+    from joblib import Parallel, delayed  # type: ignore
+except ImportError:
+    Parallel = None  # type: ignore
+    delayed = None  # type: ignore
+
+# -----------------------------
+# CONFIG (EDIT THIS SECTION)
+# -----------------------------
+@dataclass
+class Config:
+    # ---- dataset ----
+    # Local folder containing subject subfolders (e.g. .../eegmmidb/S001/). No network access at runtime.
+    DATASET_ROOT: str = "/path/to/EEGMMIDB"
+    SUBJECT_PREFIX: str = "S"
+    SUBJECT_RANGE: Tuple[int, int] = (1, 109)  # inclusive
+    # After building the list from SUBJECT_RANGE, optionally take a random subset (without
+    # replacement) for faster pilot runs.
+    # - SUBJECT_SAMPLE_N: if set (e.g. 30), randomly select exactly that many subjects (overrides fraction).
+    # - Else SUBJECT_SAMPLE_FRACTION: 1.0 = use everyone; e.g. 0.5 ≈ half the subjects.
+    # Seed makes the same subset reproducible across runs (fair, not "first N subjects").
+    SUBJECT_SAMPLE_N: Optional[int] = None
+    SUBJECT_SAMPLE_FRACTION: float = 1.0
+    SUBJECT_SAMPLE_SEED: int = 42
+    # Inclusion (applied before random subsample). Scans SUBJECT_RANGE once (loads data; same as main loop).
+    # For REST/MI/ME comparisons, require at least one epoch per condition (defaults below).
+    INCLUSION_ENABLE: bool = True
+    INCLUSION_REQUIRE_ALL_CONDITIONS: bool = True
+    INCLUSION_MIN_EPOCHS_REST: int = 1
+    INCLUSION_MIN_EPOCHS_MI: int = 1
+    INCLUSION_MIN_EPOCHS_ME: int = 1
+    EDF_RUN_PATTERN: str = "{subj}R{run:02d}.edf"
+
+    # ---- conditions definition for EEGMMIDB ----
+    # Rest: baseline eyes open run is R01 (per PhysioNet description)
+    REST_RUNS: List[int] = None
+    # Motor Execution (ME) and Motor Imagery (MI) for "left/right fist" tasks:
+    # Task 1 (ME): runs 3, 7, 11
+    # Task 2 (MI): runs 4, 8, 12
+    ME_RUNS: List[int] = None
+    MI_RUNS: List[int] = None
+
+    # ---- preprocessing ----
+    L_FREQ: float = 1.0
+    H_FREQ: float = 40.0
+    REF: str = "average"
+    EPOCH_LEN_S: float = 10.0  # 10 s fixed epochs
+    MSE_SCALES: int = 5
+
+    # ---- entropy settings ----
+    SAMPEN_M: int = 2
+    SAMPEN_R_FRAC: float = 0.2  # r = 0.2 * SD (recomputed per coarse-grained series)
+    PERMEN_ORDER: int = 3
+    # Permutation entropy (Bandt & Pompe): embedding delay tau between samples in the pattern.
+    # None = auto: first local minimum of normalized ACF (standard delay choice); int >= 1 = fixed tau.
+    PERMEN_DELAY: Optional[int] = None
+    PERMEN_DELAY_AUTO_MAX: int = 100  # max lag when searching ACF for auto tau
+    PERMEN_NORMALIZE: bool = True  # divide by log2(order!) so H is in [0, 1]
+    # If False: do not compute permutation entropy (faster; subject CSV columns stay NaN).
+    COMPUTE_PERMEN: bool = True
+    # If False: skip MSE computation (SampEn still computed as usual).
+    COMPUTE_MSE: bool = True
+    # True (default): SampEn, PermEn, MSE on each epoch, then mean over epochs (recommended).
+    # False: average epochs to one trace per channel first, then entropy (legacy; faster).
+    ENTROPY_PER_EPOCH: bool = True
+    # Speed: same Richman–Moorman SampEn (m, r = r_frac·SD) via antropy when installed.
+    SAMPEN_USE_ANTROPY: bool = True
+    # Parallelize entropy across EEG channels (1 = off; -1 = all logical CPUs). Requires joblib.
+    ENTROPY_N_JOBS: int = -1
+    # name, low_hz, high_hz (inclusive limits)
+    FFT_BANDS: List[Tuple[str, float, float]] = None
+    # Relative band power = band integral / integral over [lo, hi] on same PSD (default: L_FREQ, H_FREQ)
+    FFT_REL_POWER_DENOM_HZ: Optional[Tuple[float, float]] = None
+
+    # ---- ROI electrodes (YOUR LIST) ----
+    ROI_ELECTRODES: List[str] = None
+    # If False: skip ROI channel matching, ROI summary columns, ROI CSVs/figures, ROI p-values.
+    # Whole-scalp / per-electrode outputs are unchanged. (ROI aggregation is cheap; savings are I/O + figures.)
+    COMPUTE_ROI: bool = True
+
+    # ---- outputs ----
+    OUT_DIR_NAME: str = "entropy_results"
+    MAKE_FIGURES: bool = True
+    SAVE_CAPTIONS: bool = True
+    # Wide CSV: one row per electrode, columns mean/sem/n for REST, MI, ME
+    SAVE_SAMPEN_PER_ELECTRODE_CSV: bool = True
+    SAMPEN_PER_ELECTRODE_CSV_NAME: str = "sampen_per_electrode_mean_across_subjects.csv"
+    SAVE_FFT_BANDPOWER_PER_ELECTRODE_CSV: bool = True
+    FFT_BANDPOWER_PER_ELECTRODE_CSV_NAME: str = "fft_bandpower_per_electrode_mean_across_subjects.csv"
+
+    # ---- statistics: FDR on paired MI vs ME p-values by MSE scale ----
+    # Benjamini–Hochberg within each family (whole scales together; ROI scales together).
+    APPLY_FDR_TO_MI_VS_ME_PVALS: bool = True
+
+    # ---- optional SampEn validation: antropy on a random subset (low runtime overhead) ----
+    SAMPEN_VALIDATION_ENABLE: bool = True
+    # Fraction of subjects (with usable epochs) selected for validation; ignored if EXHAUSTIVE.
+    SAMPEN_VALIDATION_SUBJECT_FRACTION: float = 0.08
+    SAMPEN_VALIDATION_RNG_SEED: int = 42
+    SAMPEN_VALIDATION_MAX_EPOCHS_PER_COND: int = 2
+    SAMPEN_VALIDATION_N_CHANNELS: int = 4
+    # If True, validate every subject (still caps epochs/channels per subject); much slower.
+    SAMPEN_VALIDATION_EXHAUSTIVE: bool = False
+
+    # ---- plotting ----
+    # Keep these stable and readable for posters
+    COLOR_REST: str = "#444444"
+    COLOR_MI: str = "#1f77b4"
+    COLOR_ME: str = "#ff7f0e"
+    FIG_DPI: int = 180
+
+
+CFG = Config()
+CFG.REST_RUNS = [1]
+CFG.ME_RUNS = [3, 7, 11]
+CFG.MI_RUNS = [4, 8, 12]
+# None = all eligible subjects after inclusion. Set to e.g. 30 for a reproducible random subsample (see SUBJECT_SAMPLE_SEED).
+CFG.SUBJECT_SAMPLE_N = None
+CFG.SUBJECT_SAMPLE_FRACTION = 1.0  # used only when SUBJECT_SAMPLE_N is None (e.g. 0.5 for half of eligible)
+CFG.SUBJECT_SAMPLE_SEED = 42
+CFG.INCLUSION_ENABLE = True
+CFG.INCLUSION_REQUIRE_ALL_CONDITIONS = True
+CFG.INCLUSION_MIN_EPOCHS_REST = 1
+CFG.INCLUSION_MIN_EPOCHS_MI = 1
+CFG.INCLUSION_MIN_EPOCHS_ME = 1
+CFG.ENTROPY_PER_EPOCH = True  # False: average epochs to one trace per channel before entropy (legacy)
+CFG.SAMPEN_USE_ANTROPY = True  # False: always use slow pure-Python SampEn
+CFG.ENTROPY_N_JOBS = -1  # 1 = no parallel; -1 = all CPUs (needs pip install joblib)
+CFG.PERMEN_DELAY = None  # None = auto (ACF first minimum); use 1 for consecutive-sample embedding
+# Set both False for a faster pilot (SampEn + FFT band power only).
+CFG.COMPUTE_PERMEN = True  # False: skip PermEn (subject CSV PermEn columns NaN)
+CFG.COMPUTE_MSE = True  # False: skip MSE curves and MI-vs-ME scale p-values
+CFG.FFT_BANDS = [
+    ("delta", 1.0, 4.0),
+    ("theta", 4.0, 8.0),
+    ("alpha", 8.0, 13.0),
+    ("beta", 13.0, 30.0),
+    ("gamma", 30.0, 40.0),
+]
+CFG.APPLY_FDR_TO_MI_VS_ME_PVALS = True
+CFG.SAMPEN_VALIDATION_ENABLE = True
+CFG.SAMPEN_VALIDATION_SUBJECT_FRACTION = 0.08
+CFG.SAMPEN_VALIDATION_EXHAUSTIVE = False
+CFG.COMPUTE_ROI = True  # False: faster — no ROI summaries, figures, or ROI p-value columns
+
+CFG.ROI_ELECTRODES = [
+    "FC3", "FC1", "FCz", "FC2", "FC4",
+    "C5", "C3", "C1", "Cz", "C2", "C4", "C6",
+    "CP3", "CP1", "CPz", "CP2", "CP4",
+    "O1", "Oz", "O2", "Pz"
+]
+
+# Suppress EDF header runtime warnings that don't affect signal samples
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+# -----------------------------
+# Utility: subjects / paths
+# -----------------------------
+def subject_ids(cfg: Config) -> List[str]:
+    a, b = cfg.SUBJECT_RANGE
+    pool = [f"{cfg.SUBJECT_PREFIX}{i:03d}" for i in range(a, b + 1)]
+
+    if cfg.INCLUSION_ENABLE:
+        eligible: List[str] = []
+        for subj in tqdm(pool, desc="Inclusion scan"):
+            r, mi, me, _, _ = load_subject_epochs(cfg, subj)
+            if subject_passes_inclusion(r, mi, me, cfg):
+                eligible.append(subj)
+        print(
+            f"[INFO] Inclusion: {len(eligible)}/{len(pool)} subjects eligible "
+            f"(require_all={cfg.INCLUSION_REQUIRE_ALL_CONDITIONS}; "
+            f"min_epochs REST/MI/ME = "
+            f"{cfg.INCLUSION_MIN_EPOCHS_REST}/{cfg.INCLUSION_MIN_EPOCHS_MI}/{cfg.INCLUSION_MIN_EPOCHS_ME})."
+        )
+        if len(eligible) == 0:
+            raise RuntimeError(
+                "No subjects meet inclusion criteria. Set INCLUSION_ENABLE=False to skip this gate, "
+                "or lower INCLUSION_MIN_EPOCHS_* / set INCLUSION_REQUIRE_ALL_CONDITIONS=False."
+            )
+        ids = eligible
+    else:
+        ids = list(pool)
+
+    rng = np.random.default_rng(int(cfg.SUBJECT_SAMPLE_SEED))
+
+    n_fixed = cfg.SUBJECT_SAMPLE_N
+    if n_fixed is not None:
+        n_take = int(n_fixed)
+        if n_take <= 0:
+            raise ValueError("SUBJECT_SAMPLE_N must be a positive integer")
+        if n_take > len(ids):
+            raise RuntimeError(
+                f"SUBJECT_SAMPLE_N={n_take} exceeds eligible subjects ({len(ids)}). "
+                "Lower N, widen SUBJECT_RANGE, disable INCLUSION_ENABLE, or relax inclusion minima."
+            )
+        pick = rng.choice(len(ids), size=n_take, replace=False)
+        pick.sort()
+        out = [ids[i] for i in pick]
+        print(
+            f"[INFO] Random subject subsample: {len(out)}/{len(ids)} eligible subjects "
+            f"(SUBJECT_SAMPLE_N={n_take}, seed={cfg.SUBJECT_SAMPLE_SEED})."
+        )
+        return out
+
+    frac = float(cfg.SUBJECT_SAMPLE_FRACTION)
+    if frac >= 1.0:
+        return ids
+    if not (0.0 < frac < 1.0):
+        raise ValueError("SUBJECT_SAMPLE_FRACTION must be in (0, 1.0] or use 1.0 for all subjects")
+    n_take = max(1, int(round(len(ids) * frac)))
+    n_take = min(n_take, len(ids))
+    pick = rng.choice(len(ids), size=n_take, replace=False)
+    pick.sort()
+    out = [ids[i] for i in pick]
+    print(
+        f"[INFO] Random subject subsample: {len(out)}/{len(ids)} subjects "
+        f"(fraction={frac}, seed={cfg.SUBJECT_SAMPLE_SEED})."
+    )
+    return out
+
+def subj_folder(cfg: Config, subj: str) -> str:
+    return os.path.join(cfg.DATASET_ROOT, subj)
+
+def run_path(cfg: Config, subj: str, run: int) -> str:
+    return os.path.join(subj_folder(cfg, subj), cfg.EDF_RUN_PATTERN.format(subj=subj, run=run))
+
+# -----------------------------
+# Robust channel matching (ROI)
+# -----------------------------
+def _norm_ch_name(name: str) -> str:
+    """
+    Normalize channel names to make matching robust across EDF variations:
+    - uppercase
+    - strip whitespace
+    - remove common punctuation
+    """
+    if name is None:
+        return ""
+    x = name.strip().upper()
+    x = re.sub(r"[\s\.\-_/]", "", x)  # remove spaces and punctuation
+    return x
+
+def pick_roi_indices(ch_names: List[str], roi_names: List[str]) -> Tuple[List[int], List[str], List[str]]:
+    """
+    Returns:
+      idx: channel indices found
+      found: ROI names found (original forms)
+      missing: ROI names missing
+    """
+    # Map normalized channel name -> index
+    chan_map = {_norm_ch_name(ch): i for i, ch in enumerate(ch_names)}
+
+    idx = []
+    found = []
+    missing = []
+
+    for roi in roi_names:
+        key = _norm_ch_name(roi)
+        if key in chan_map:
+            idx.append(chan_map[key])
+            found.append(roi)
+        else:
+            missing.append(roi)
+
+    # De-dup while preserving order
+    seen = set()
+    idx2, found2 = [], []
+    for i, r in zip(idx, found):
+        if i not in seen:
+            seen.add(i)
+            idx2.append(i)
+            found2.append(r)
+
+    return idx2, found2, missing
+
+# -----------------------------
+# Preprocessing / epoching
+# -----------------------------
+def load_and_preprocess_edf(path: str, cfg: Config) -> Optional[mne.io.BaseRaw]:
+    if not os.path.exists(path):
+        return None
+    try:
+        raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
+        raw.pick_types(eeg=True)  # legacy warning is OK; can change to raw.pick('eeg') later
+        raw.filter(cfg.L_FREQ, cfg.H_FREQ, verbose=False)
+        raw.set_eeg_reference(cfg.REF, verbose=False)
+        return raw
+    except Exception as e:
+        print(f"[WARN] Failed to read {path}: {e}")
+        return None
+
+def enforce_epoch_length(epoch_list: List[np.ndarray], expected_len: int) -> List[np.ndarray]:
+    """
+    Keep only epochs with exact sample length.
+    Each epoch here is (n_ch, n_samp).
+    """
+    clean = []
+    for ep in epoch_list:
+        if ep is None:
+            continue
+        if ep.shape[-1] == expected_len:
+            clean.append(ep)
+    return clean
+
+def epochs_from_annotations(raw: mne.io.BaseRaw, label: str, cfg: Config) -> List[np.ndarray]:
+    """
+    Extracts 10s epochs starting at the onset of each annotation == label.
+    Returns list of (n_ch, n_samp) epochs.
+    """
+    sfreq = raw.info["sfreq"]
+    n_samp = int(cfg.EPOCH_LEN_S * sfreq)
+
+    # MNE stores onsets in seconds
+    onsets_s = [float(a["onset"]) for a in raw.annotations if str(a["description"]) == label]
+    epochs = []
+    for onset in onsets_s:
+        start = int(round(onset * sfreq))
+        stop = start + n_samp
+        if start < 0:
+            continue
+        if stop <= raw.n_times:
+            seg = raw.get_data(start=start, stop=stop)  # (ch, samp)
+            if seg.shape[1] == n_samp:
+                epochs.append(seg)
+    # Drop any accidental partials (extra safety)
+    return enforce_epoch_length(epochs, n_samp)
+
+def epochs_from_continuous(raw: mne.io.BaseRaw, cfg: Config) -> List[np.ndarray]:
+    """
+    For baseline runs that may not have T0/T1/T2 annotations:
+    chunk into back-to-back 10s epochs from t=0.
+    """
+    sfreq = raw.info["sfreq"]
+    n_samp = int(cfg.EPOCH_LEN_S * sfreq)
+    n_epochs = raw.n_times // n_samp
+    epochs = []
+    for i in range(n_epochs):
+        start = i * n_samp
+        stop = start + n_samp
+        seg = raw.get_data(start=start, stop=stop)
+        if seg.shape[1] == n_samp:
+            epochs.append(seg)
+    return epochs
+
+
+def load_subject_epochs(
+    cfg: Config, subj: str
+) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray], Optional[List[str]], Optional[float]]:
+    """
+    Load REST / MI / ME epoch lists for one subject (same logic as main pipeline loop).
+    Returns (rest_epochs, mi_epochs, me_epochs, ch_names, sfreq). Empty lists if folder missing or no runs load.
+    """
+    folder = subj_folder(cfg, subj)
+    if not os.path.isdir(folder):
+        return [], [], [], None, None
+
+    subj_ch_names: Optional[List[str]] = None
+    subj_sfreq: Optional[float] = None
+
+    def _capture_ch_names(raw: mne.io.BaseRaw) -> None:
+        nonlocal subj_ch_names, subj_sfreq
+        if subj_ch_names is None:
+            subj_ch_names = list(raw.ch_names)
+        if subj_sfreq is None:
+            subj_sfreq = float(raw.info["sfreq"])
+
+    rest_epochs: List[np.ndarray] = []
+    for run in cfg.REST_RUNS:
+        p = run_path(cfg, subj, run)
+        raw = load_and_preprocess_edf(p, cfg)
+        if raw is None:
+            continue
+        _capture_ch_names(raw)
+        rest_epochs.extend(epochs_from_continuous(raw, cfg))
+
+    me_epochs: List[np.ndarray] = []
+    for run in cfg.ME_RUNS:
+        p = run_path(cfg, subj, run)
+        raw = load_and_preprocess_edf(p, cfg)
+        if raw is None:
+            continue
+        _capture_ch_names(raw)
+        me_epochs.extend(epochs_from_annotations(raw, "T1", cfg))
+        me_epochs.extend(epochs_from_annotations(raw, "T2", cfg))
+
+    mi_epochs: List[np.ndarray] = []
+    for run in cfg.MI_RUNS:
+        p = run_path(cfg, subj, run)
+        raw = load_and_preprocess_edf(p, cfg)
+        if raw is None:
+            continue
+        _capture_ch_names(raw)
+        mi_epochs.extend(epochs_from_annotations(raw, "T1", cfg))
+        mi_epochs.extend(epochs_from_annotations(raw, "T2", cfg))
+
+    return rest_epochs, mi_epochs, me_epochs, subj_ch_names, subj_sfreq
+
+
+def subject_passes_inclusion(
+    rest_epochs: List[np.ndarray],
+    mi_epochs: List[np.ndarray],
+    me_epochs: List[np.ndarray],
+    cfg: Config,
+) -> bool:
+    """Standard-practice gate: enough usable epochs per condition for REST/MI/ME analyses."""
+    if not cfg.INCLUSION_ENABLE:
+        return True
+    nr, nmi, nme = len(rest_epochs), len(mi_epochs), len(me_epochs)
+    if cfg.INCLUSION_REQUIRE_ALL_CONDITIONS:
+        return (
+            nr >= cfg.INCLUSION_MIN_EPOCHS_REST
+            and nmi >= cfg.INCLUSION_MIN_EPOCHS_MI
+            and nme >= cfg.INCLUSION_MIN_EPOCHS_ME
+        )
+    return (nr > 0) or (nmi > 0) or (nme > 0)
+
+
+# -----------------------------
+# Entropy functions
+# -----------------------------
+def sample_entropy(x: np.ndarray, m: int = 2, r: Optional[float] = None, r_frac: Optional[float] = None) -> float:
+    """
+    Sample Entropy (Richman–Moorman style, Chebyshev distance).
+    Uses antropy (fast) when CFG.SAMPEN_USE_ANTROPY and antropy is installed; else pure-Python O(N^2).
+    r_frac defaults to CFG.SAMPEN_R_FRAC when r is None.
+    """
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size < (m + 2):
+        return np.nan
+
+    if r is None:
+        sd = np.std(x)
+        if not np.isfinite(sd) or sd == 0:
+            return np.nan
+        frac = CFG.SAMPEN_R_FRAC if r_frac is None else r_frac
+        r = frac * sd
+
+    if CFG.SAMPEN_USE_ANTROPY and _antropy_sample_entropy is not None:
+        try:
+            return float(_antropy_sample_entropy(x, order=m, r=r))
+        except Exception:
+            pass
+
+    N = x.size
+
+    def _phi(mm: int) -> float:
+        xm = np.array([x[i:i + mm] for i in range(N - mm + 1)])
+        dist = np.max(np.abs(xm[:, None, :] - xm[None, :, :]), axis=2)
+        C = (dist <= r).sum(axis=0) - 1  # exclude self-match
+        return float(C.sum())
+
+    A = _phi(m + 1)
+    B = _phi(m)
+    if A <= 0 or B <= 0:
+        return np.nan
+    return float(-np.log(A / B))
+
+def _perm_delay_autocorr_first_minimum(x: np.ndarray, max_lag: int) -> int:
+    """
+    Standard delay for ordinal patterns: first local minimum of the normalized autocorrelation
+    (lag >= 1). Falls back to 1 if none found or series too short.
+    """
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size < 20:
+        return 1
+    x = x - np.mean(x)
+    max_lag = min(max_lag, x.size // 3, x.size - 2)
+    max_lag = max(2, max_lag)
+    acs: List[float] = []
+    for lag in range(1, max_lag + 1):
+        a, b = x[:-lag], x[lag:]
+        den = float(np.linalg.norm(a) * np.linalg.norm(b))
+        if den <= 0:
+            acs.append(1.0)
+        else:
+            acs.append(float(np.dot(a, b) / den))
+    acs_arr = np.asarray(acs, dtype=float)
+    for i in range(1, len(acs_arr) - 1):
+        if acs_arr[i] < acs_arr[i - 1] and acs_arr[i] <= acs_arr[i + 1]:
+            return i + 1  # lag is 1-based index into ACF
+    return 1
+
+
+def _ordinal_pattern_bandt_pompe(w: np.ndarray) -> Tuple[int, ...]:
+    """
+    Ordinal pattern with lexicographic tie-breaking (Bandt & Pompe).
+    Returns a tuple of length m giving the permutation that sorts the window ascending.
+    """
+    w = np.asarray(w, dtype=float)
+    m = w.size
+    # np.lexsort: sort by w (last key primary), then by index for ties
+    return tuple(np.lexsort((np.arange(m, dtype=int), w)))
+
+
+def permutation_entropy(x: np.ndarray, cfg: Config) -> float:
+    """
+    Bandt–Pompe permutation entropy (Physica A, 2002).
+
+    - Embeddings: (x[i], x[i+tau], ..., x[i+(m-1)*tau]) with embedding dimension m = PERMEN_ORDER.
+    - tau = PERMEN_DELAY if set, else first local minimum of normalized ACF (common practice).
+    - Ties: lexicographic ordering (via numpy.lexsort on value then index).
+    - Normalization: divide by log2(m!) if PERMEN_NORMALIZE.
+    """
+    order = cfg.PERMEN_ORDER
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    n = x.size
+
+    if cfg.PERMEN_DELAY is not None:
+        tau = max(1, int(cfg.PERMEN_DELAY))
+    else:
+        tau = _perm_delay_autocorr_first_minimum(x, cfg.PERMEN_DELAY_AUTO_MAX)
+
+    # Need at least one full embedding window
+    span = (order - 1) * tau
+    if n < span + 1:
+        return np.nan
+
+    n_pat = n - span
+    if n_pat < 1:
+        return np.nan
+
+    counts: Dict[Tuple[int, ...], int] = defaultdict(int)
+    for i in range(n_pat):
+        w = x[i : i + span + 1 : tau]
+        if w.size != order:
+            continue
+        pat = _ordinal_pattern_bandt_pompe(w)
+        counts[pat] += 1
+
+    total = float(sum(counts.values()))
+    if total <= 0:
+        return np.nan
+
+    pe = 0.0
+    for c in counts.values():
+        p = c / total
+        pe -= p * math.log2(p)
+
+    if cfg.PERMEN_NORMALIZE:
+        max_pe = math.log2(math.factorial(order))
+        if max_pe > 0:
+            pe = pe / max_pe
+    return float(pe)
+
+def multiscale_entropy(x: np.ndarray, scales: int = 5, m: int = 2) -> np.ndarray:
+    """
+    Coarse-grain by averaging non-overlapping windows of length s,
+    then compute SampEn at each scale. Recomputes r at each scale (via sd).
+    """
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size < 50:
+        return np.full(scales, np.nan)
+
+    out = []
+    for s in range(1, scales + 1):
+        n = x.size // s
+        if n < 50:
+            out.append(np.nan)
+            continue
+        y = np.mean(x[:n * s].reshape(n, s), axis=1)
+        out.append(sample_entropy(y, m=m, r=None, r_frac=CFG.SAMPEN_R_FRAC))
+    return np.array(out, dtype=float)
+
+
+def _resolve_entropy_n_jobs(cfg: Config) -> int:
+    if cfg.ENTROPY_N_JOBS == 1:
+        return 1
+    if Parallel is None:
+        return 1
+    j = cfg.ENTROPY_N_JOBS
+    if j == -1:
+        return max(1, os.cpu_count() or 1)
+    return max(1, int(j))
+
+
+def _channel_entropy_block(ch: int, all_ep: np.ndarray, cfg: Config) -> Tuple[np.ndarray, float, float]:
+    """One channel: MSE-by-scale row, SampEn, PermEn (used with optional joblib parallel)."""
+    n_ep = all_ep.shape[0]
+    if cfg.ENTROPY_PER_EPOCH:
+        mse_rows = []
+        samp_vals = []
+        perm_vals: List[float] = []
+        for e in range(n_ep):
+            sig = all_ep[e, ch, :]
+            if cfg.COMPUTE_MSE:
+                mse_rows.append(multiscale_entropy(sig, scales=cfg.MSE_SCALES, m=cfg.SAMPEN_M))
+            samp_vals.append(
+                sample_entropy(sig, m=cfg.SAMPEN_M, r=None, r_frac=cfg.SAMPEN_R_FRAC)
+            )
+            if cfg.COMPUTE_PERMEN:
+                perm_vals.append(permutation_entropy(sig, cfg))
+        if cfg.COMPUTE_MSE and mse_rows:
+            mse_ch_row = np.nanmean(np.stack(mse_rows, axis=0), axis=0)
+        else:
+            mse_ch_row = np.full(cfg.MSE_SCALES, np.nan)
+        samp_ch = float(np.nanmean(samp_vals))
+        if cfg.COMPUTE_PERMEN:
+            perm_ch = float(np.nanmean(perm_vals)) if perm_vals else np.nan
+        else:
+            perm_ch = np.nan
+    else:
+        sig = all_ep.mean(axis=0)[ch, :]
+        samp_ch = sample_entropy(sig, m=cfg.SAMPEN_M, r=None, r_frac=cfg.SAMPEN_R_FRAC)
+        if cfg.COMPUTE_MSE:
+            mse_ch_row = multiscale_entropy(sig, scales=cfg.MSE_SCALES, m=cfg.SAMPEN_M)
+        else:
+            mse_ch_row = np.full(cfg.MSE_SCALES, np.nan)
+        perm_ch = permutation_entropy(sig, cfg) if cfg.COMPUTE_PERMEN else np.nan
+    return mse_ch_row, samp_ch, float(perm_ch)
+
+
+def _sampen_per_ch_one(ch: int, all_ep: np.ndarray, cfg: Config) -> float:
+    if cfg.ENTROPY_PER_EPOCH:
+        vals = [
+            sample_entropy(all_ep[e, ch, :], m=cfg.SAMPEN_M, r=None, r_frac=cfg.SAMPEN_R_FRAC)
+            for e in range(all_ep.shape[0])
+        ]
+        return float(np.nanmean(vals))
+    sig = all_ep.mean(axis=0)[ch, :]
+    return float(sample_entropy(sig, m=cfg.SAMPEN_M, r=None, r_frac=cfg.SAMPEN_R_FRAC))
+
+
+def sample_entropy_per_channel_from_epochs(
+    epochs: List[np.ndarray],
+    ch_names: List[str],
+    cfg: Config,
+) -> np.ndarray:
+    """
+    Per-channel SampEn (whole scalp). Uses ENTROPY_PER_EPOCH:
+    True: mean of SampEn over epochs; False: SampEn on epoch-averaged signal.
+    Returns shape (n_ch,) aligned with ch_names. NaN if no epochs or mismatch.
+    """
+    if not epochs or not ch_names:
+        return np.array([], dtype=float)
+    all_ep = np.stack(epochs, axis=0)  # (n_ep, n_ch, n_samp)
+    n_ch_data, n_ch_names = all_ep.shape[1], len(ch_names)
+    if n_ch_data != n_ch_names:
+        print(
+            f"[WARN] Channel count mismatch (data={n_ch_data}, names={n_ch_names}); "
+            "skipping per-electrode SampEn for this subject."
+        )
+        return np.full(n_ch_names, np.nan, dtype=float)
+
+    nj = _resolve_entropy_n_jobs(cfg)
+    if Parallel is not None and delayed is not None and nj > 1 and n_ch_data > 1:
+        parts = Parallel(n_jobs=nj)(
+            delayed(_sampen_per_ch_one)(ch, all_ep, cfg) for ch in range(n_ch_data)
+        )
+        return np.asarray(parts, dtype=float)
+    out = np.full(n_ch_data, np.nan, dtype=float)
+    for ch in range(n_ch_data):
+        out[ch] = _sampen_per_ch_one(ch, all_ep, cfg)
+    return out
+
+
+def _fft_rel_power_denom_hz(cfg: Config) -> Tuple[float, float]:
+    if cfg.FFT_REL_POWER_DENOM_HZ is not None:
+        return float(cfg.FFT_REL_POWER_DENOM_HZ[0]), float(cfg.FFT_REL_POWER_DENOM_HZ[1])
+    return float(cfg.L_FREQ), float(cfg.H_FREQ)
+
+
+def fft_bandpower_per_channel_from_epochs(
+    epochs: List[np.ndarray],
+    ch_names: List[str],
+    sfreq: Optional[float],
+    cfg: Config,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compute FFT band power per channel from condition-averaged signal (one rfft per channel).
+    Returns (absolute, relative) each shape (n_ch, n_bands).
+    Relative = band power / integral of PSD over the denominator band (default: L_FREQ–H_FREQ).
+    """
+    n_b = len(cfg.FFT_BANDS)
+    if not epochs or not ch_names or sfreq is None or sfreq <= 0:
+        return np.array([]), np.array([])
+
+    all_ep = np.stack(epochs, axis=0)
+    avg = all_ep.mean(axis=0)  # (n_ch, n_samp)
+    n_ch_data, n_ch_names = avg.shape[0], len(ch_names)
+    if n_ch_data != n_ch_names:
+        print(
+            f"[WARN] Channel count mismatch (data={n_ch_data}, names={n_ch_names}); "
+            "skipping per-electrode FFT band power for this subject."
+        )
+        nan2 = np.full((n_ch_names, n_b), np.nan, dtype=float)
+        return nan2, nan2
+
+    n_samp = avg.shape[1]
+    if n_samp < 4:
+        nan2 = np.full((n_ch_data, n_b), np.nan, dtype=float)
+        return nan2, nan2
+
+    freqs = np.fft.rfftfreq(n_samp, d=1.0 / float(sfreq))
+    d_lo, d_hi = _fft_rel_power_denom_hz(cfg)
+    denom_mask = (freqs >= d_lo) & (freqs <= d_hi)
+
+    out_abs = np.full((n_ch_data, n_b), np.nan, dtype=float)
+    out_rel = np.full((n_ch_data, n_b), np.nan, dtype=float)
+
+    for ch in range(n_ch_data):
+        sig = avg[ch]
+        if not np.all(np.isfinite(sig)):
+            sig = np.nan_to_num(sig, nan=0.0)
+        sig = sig - np.mean(sig)
+        fft_vals = np.fft.rfft(sig)
+        psd = (np.abs(fft_vals) ** 2) / max(n_samp, 1)
+
+        if np.count_nonzero(denom_mask) < 2:
+            total_pow = np.nan
+        else:
+            total_pow = float(np.trapz(psd[denom_mask], freqs[denom_mask]))
+        use_rel = np.isfinite(total_pow) and total_pow > 0
+
+        for b_idx, (_band_name, lo, hi) in enumerate(cfg.FFT_BANDS):
+            mask = (freqs >= lo) & (freqs <= hi)
+            if np.count_nonzero(mask) < 2:
+                continue
+            band_pow = float(np.trapz(psd[mask], freqs[mask]))
+            out_abs[ch, b_idx] = band_pow
+            if use_rel and np.isfinite(band_pow):
+                out_rel[ch, b_idx] = band_pow / total_pow
+
+    return out_abs, out_rel
+
+
+def entropy_per_channel_from_epochs(
+    epochs: List[np.ndarray],
+    cfg: Config,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    One pass over all EEG channels: MSE (per scale), SampEn, PermEn per channel.
+    Returns (mse_ch (n_ch, n_scales), samp_ch (n_ch,), perm_ch (n_ch,)).
+    Used for whole-scalp + ROI summaries and per-electrode CSV (reuse samp_ch; no second SampEn pass).
+    """
+    if epochs is None or len(epochs) == 0:
+        return (
+            np.zeros((0, cfg.MSE_SCALES)),
+            np.array([], dtype=float),
+            np.array([], dtype=float),
+        )
+
+    all_ep = np.stack(epochs, axis=0)
+    n_ch = all_ep.shape[1]
+    if n_ch == 0:
+        return (
+            np.zeros((0, cfg.MSE_SCALES)),
+            np.array([], dtype=float),
+            np.array([], dtype=float),
+        )
+
+    mse_ch = np.full((n_ch, cfg.MSE_SCALES), np.nan)
+    samp_ch = np.full(n_ch, np.nan)
+    perm_ch = np.full(n_ch, np.nan)
+
+    nj = _resolve_entropy_n_jobs(cfg)
+    if Parallel is not None and delayed is not None and nj > 1 and n_ch > 1:
+        results = Parallel(n_jobs=nj)(
+            delayed(_channel_entropy_block)(ch, all_ep, cfg) for ch in range(n_ch)
+        )
+        for ch, (mse_row, s, p) in enumerate(results):
+            mse_ch[ch, :] = mse_row
+            samp_ch[ch] = s
+            perm_ch[ch] = p
+    else:
+        for ch in range(n_ch):
+            mse_row, s, p = _channel_entropy_block(ch, all_ep, cfg)
+            mse_ch[ch, :] = mse_row
+            samp_ch[ch] = s
+            perm_ch[ch] = p
+
+    return mse_ch, samp_ch, perm_ch
+
+
+def _mean_entropy_scalars(
+    mse_ch: np.ndarray,
+    samp_ch: np.ndarray,
+    perm_ch: np.ndarray,
+    roi_idx: Optional[List[int]],
+    cfg: Config,
+) -> Tuple[np.ndarray, float, float]:
+    """Mean MSE/SampEn/PermEn across channels (all channels, or ROI subset by indices)."""
+    if mse_ch.size == 0 or samp_ch.size == 0:
+        return np.full(cfg.MSE_SCALES, np.nan), float("nan"), float("nan")
+    if roi_idx is not None:
+        if len(roi_idx) == 0:
+            return np.full(cfg.MSE_SCALES, np.nan), float("nan"), float("nan")
+        mse_ch = mse_ch[np.asarray(roi_idx, dtype=int)]
+        samp_ch = samp_ch[np.asarray(roi_idx, dtype=int)]
+        perm_ch = perm_ch[np.asarray(roi_idx, dtype=int)]
+    mse_mean = np.nanmean(mse_ch, axis=0)
+    samp_mean = float(np.nanmean(samp_ch))
+    perm_mean = float(np.nanmean(perm_ch))
+    return mse_mean, samp_mean, perm_mean
+
+
+def _nan_entropy_roi_scalars(cfg: Config) -> Tuple[np.ndarray, float, float]:
+    """Placeholder when COMPUTE_ROI is False."""
+    return np.full(cfg.MSE_SCALES, np.nan), float("nan"), float("nan")
+
+
+def entropy_from_epochs(
+    epochs: List[np.ndarray],
+    roi_idx: Optional[List[int]],
+    cfg: Config,
+) -> Tuple[np.ndarray, float, float]:
+    """
+    Backwards-compatible: one full-channel compute, then aggregate for whole scalp or ROI.
+    Prefer calling entropy_per_channel_from_epochs once per condition in hot paths.
+    """
+    mse_ch, samp_ch, perm_ch = entropy_per_channel_from_epochs(epochs, cfg)
+    return _mean_entropy_scalars(mse_ch, samp_ch, perm_ch, roi_idx, cfg)
+
+# -----------------------------
+# Stats helpers
+# -----------------------------
+def sem(x: np.ndarray, axis: int = 0) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    n = np.sum(np.isfinite(x), axis=axis)
+    sd = np.nanstd(x, axis=axis, ddof=1)
+    return sd / np.sqrt(np.maximum(n, 1))
+
+def paired_pvals_by_scale(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """
+    a,b: (n_subj, n_scales)
+    returns pvals (n_scales,)
+    """
+    pvals = np.full(a.shape[1], np.nan)
+    for s in range(a.shape[1]):
+        aa = a[:, s]
+        bb = b[:, s]
+        mask = np.isfinite(aa) & np.isfinite(bb)
+        if mask.sum() >= 5:
+            _, p = ttest_rel(aa[mask], bb[mask], nan_policy="omit")
+            pvals[s] = p
+    return pvals
+
+
+def benjamini_hochberg_fdr(pvals: np.ndarray) -> np.ndarray:
+    """
+    Benjamini–Hochberg FDR-adjusted p-values (same length as input).
+    Non-finite entries are left as NaN and excluded from the adjustment.
+    """
+    p = np.asarray(pvals, dtype=float)
+    out = np.full_like(p, np.nan, dtype=float)
+    mask = np.isfinite(p)
+    if not np.any(mask):
+        return out
+    pv = p[mask]
+    n = pv.size
+    order = np.argsort(pv)
+    ranked = pv[order]
+    q = ranked * n / np.arange(1, n + 1)
+    q = np.minimum.accumulate(q[::-1])[::-1]
+    out_flat = np.empty(n)
+    out_flat[order] = np.clip(q, 0.0, 1.0)
+    out[mask] = out_flat
+    return out
+
+
+def antropy_sample_entropy_match_cfg(x: np.ndarray, cfg: Config) -> float:
+    """antropy.sample_entropy with same m and r (absolute) as custom code."""
+    if _antropy_sample_entropy is None:
+        return np.nan
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size < (cfg.SAMPEN_M + 2):
+        return np.nan
+    sd = np.std(x)
+    if not np.isfinite(sd) or sd == 0:
+        return np.nan
+    r = cfg.SAMPEN_R_FRAC * sd
+    try:
+        return float(_antropy_sample_entropy(x, order=cfg.SAMPEN_M, r=r))
+    except Exception:
+        return np.nan
+
+
+def collect_sampen_antropy_validation(
+    subj: str,
+    rest_epochs: List[np.ndarray],
+    mi_epochs: List[np.ndarray],
+    me_epochs: List[np.ndarray],
+    ch_names: List[str],
+    cfg: Config,
+    rng: np.random.Generator,
+) -> List[Dict[str, object]]:
+    """
+    Compare custom SampEn vs antropy on random epochs/channels (low overhead).
+    """
+    rows: List[Dict[str, object]] = []
+    if not cfg.SAMPEN_VALIDATION_ENABLE or _antropy_sample_entropy is None:
+        return rows
+    if cfg.SAMPEN_VALIDATION_EXHAUSTIVE:
+        pick_subj = True
+    else:
+        pick_subj = rng.random() < cfg.SAMPEN_VALIDATION_SUBJECT_FRACTION
+    if not pick_subj:
+        return rows
+
+    cond_map = [
+        ("REST", rest_epochs),
+        ("MI", mi_epochs),
+        ("ME", me_epochs),
+    ]
+    for cond, ep_list in cond_map:
+        if not ep_list or not ch_names:
+            continue
+        all_ep = np.stack(ep_list, axis=0)
+        n_ep, n_ch, _ = all_ep.shape
+        if n_ch != len(ch_names):
+            continue
+        n_ep_pick = min(cfg.SAMPEN_VALIDATION_MAX_EPOCHS_PER_COND, n_ep)
+        n_ch_pick = min(cfg.SAMPEN_VALIDATION_N_CHANNELS, n_ch)
+        ep_idx = rng.choice(n_ep, size=n_ep_pick, replace=False)
+        ch_idx = rng.choice(n_ch, size=n_ch_pick, replace=False)
+        for e in ep_idx:
+            for ch in ch_idx:
+                sig = all_ep[e, ch, :]
+                c = sample_entropy(
+                    sig, m=cfg.SAMPEN_M, r=None, r_frac=cfg.SAMPEN_R_FRAC
+                )
+                a = antropy_sample_entropy_match_cfg(sig, cfg)
+                ad = np.nan
+                if np.isfinite(c) and np.isfinite(a):
+                    ad = float(abs(c - a))
+                rows.append({
+                    "subject": subj,
+                    "condition": cond,
+                    "epoch_index": int(e),
+                    "channel_index": int(ch),
+                    "channel_name": ch_names[ch],
+                    "sampen_custom": c,
+                    "sampen_antropy": a,
+                    "abs_diff": ad,
+                })
+    return rows
+
+
+def aggregate_sampen_by_electrode(
+    per_subject: List[Tuple[str, List[str], np.ndarray, np.ndarray, np.ndarray]],
+) -> pd.DataFrame:
+    """
+    per_subject: list of (subject_id, ch_names, samp_rest, samp_mi, samp_me)
+    Each samp_* is (n_ch,) with NaNs when condition missing.
+    Aggregates by normalized channel label; keeps a display name per key.
+    """
+    # norm_key -> {rest: [], mi: [], me: [], display: str}
+    acc: Dict[str, Dict[str, object]] = defaultdict(
+        lambda: {"rest": [], "mi": [], "me": [], "display": ""}
+    )
+
+    for _subj, names, sr, smi, sme in per_subject:
+        if not names or sr.size == 0:
+            continue
+        n = min(len(names), sr.size, smi.size, sme.size)
+        for i in range(n):
+            key = _norm_ch_name(names[i])
+            if not key:
+                continue
+            slot = acc[key]
+            if not slot["display"]:
+                slot["display"] = names[i]
+            slot["rest"].append(float(sr[i]))
+            slot["mi"].append(float(smi[i]))
+            slot["me"].append(float(sme[i]))
+
+    rows = []
+    for key in sorted(acc.keys(), key=lambda k: acc[k]["display"] or k):
+        slot = acc[key]
+        disp = slot["display"] or key
+        for cond, col_prefix in [("rest", "rest"), ("mi", "mi"), ("me", "me")]:
+            vals = np.asarray(slot[cond], dtype=float)
+            finite = vals[np.isfinite(vals)]
+            n_sub = int(finite.size)
+            rows.append({
+                "channel_norm": key,
+                "channel": disp,
+                "condition": col_prefix.upper(),
+                "n_subjects": n_sub,
+                "sampen_mean": float(np.mean(finite)) if n_sub else np.nan,
+                "sampen_sem": float(sem(finite)) if n_sub > 1 else (0.0 if n_sub == 1 else np.nan),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def sampen_per_electrode_wide_csv(df_long: pd.DataFrame) -> pd.DataFrame:
+    """One row per electrode; REST/MI/ME as mean, sem, n columns."""
+    if df_long.empty:
+        return df_long
+    rows = []
+    for key, g in df_long.groupby("channel_norm", sort=False):
+        row: Dict[str, object] = {"channel_norm": key, "channel": g["channel"].iloc[0]}
+        for _, r in g.iterrows():
+            cond = str(r["condition"]).lower()
+            row[f"sampen_{cond}_mean"] = r["sampen_mean"]
+            row[f"sampen_{cond}_sem"] = r["sampen_sem"]
+            row[f"n_subjects_{cond}"] = r["n_subjects"]
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    return out.sort_values("channel_norm")
+
+
+def aggregate_fft_bandpower_by_electrode(
+    per_subject: List[
+        Tuple[str, List[str], List[str], np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    ],
+) -> pd.DataFrame:
+    """
+    per_subject: (subject_id, ch_names, band_names,
+                  abs_rest, abs_mi, abs_me, rel_rest, rel_mi, rel_me)
+    each *_mat shape: (n_ch, n_bands)
+    """
+    acc: Dict[Tuple[str, str], Dict[str, object]] = defaultdict(
+        lambda: {
+            "rest": [], "mi": [], "me": [],
+            "rel_rest": [], "rel_mi": [], "rel_me": [],
+            "display": "",
+        }
+    )
+
+    for _subj, names, band_names, br, bmi, bme, rr, rmi, rme in per_subject:
+        if not names or br.size == 0:
+            continue
+        n_ch = min(len(names), br.shape[0], bmi.shape[0], bme.shape[0], rr.shape[0], rmi.shape[0], rme.shape[0])
+        n_bands = min(
+            len(band_names),
+            br.shape[1], bmi.shape[1], bme.shape[1],
+            rr.shape[1], rmi.shape[1], rme.shape[1],
+        )
+        for i in range(n_ch):
+            ch_key = _norm_ch_name(names[i])
+            if not ch_key:
+                continue
+            for b in range(n_bands):
+                band_name = str(band_names[b])
+                key = (ch_key, band_name)
+                slot = acc[key]
+                if not slot["display"]:
+                    slot["display"] = names[i]
+                slot["rest"].append(float(br[i, b]))
+                slot["mi"].append(float(bmi[i, b]))
+                slot["me"].append(float(bme[i, b]))
+                slot["rel_rest"].append(float(rr[i, b]))
+                slot["rel_mi"].append(float(rmi[i, b]))
+                slot["rel_me"].append(float(rme[i, b]))
+
+    rows = []
+    for (ch_key, band_name) in sorted(acc.keys(), key=lambda k: ((acc[k]["display"] or k[0]), k[1])):
+        slot = acc[(ch_key, band_name)]
+        disp = slot["display"] or ch_key
+        for cond, rel_key in [("rest", "rel_rest"), ("mi", "rel_mi"), ("me", "rel_me")]:
+            vals = np.asarray(slot[cond], dtype=float)
+            finite = vals[np.isfinite(vals)]
+            n_sub = int(finite.size)
+            vals_r = np.asarray(slot[rel_key], dtype=float)
+            finite_r = vals_r[np.isfinite(vals_r)]
+            n_sub_r = int(finite_r.size)
+            rows.append({
+                "channel_norm": ch_key,
+                "channel": disp,
+                "band": band_name,
+                "condition": cond.upper(),
+                "n_subjects": n_sub,
+                "bandpower_mean": float(np.mean(finite)) if n_sub else np.nan,
+                "bandpower_sem": float(sem(finite)) if n_sub > 1 else (0.0 if n_sub == 1 else np.nan),
+                "bandpower_rel_mean": float(np.mean(finite_r)) if n_sub_r else np.nan,
+                "bandpower_rel_sem": float(sem(finite_r)) if n_sub_r > 1 else (0.0 if n_sub_r == 1 else np.nan),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def fft_bandpower_per_electrode_wide_csv(df_long: pd.DataFrame) -> pd.DataFrame:
+    """
+    One row per electrode per band, with REST/MI/ME mean/sem/n columns.
+    """
+    if df_long.empty:
+        return df_long
+    rows = []
+    for (key, band), g in df_long.groupby(["channel_norm", "band"], sort=False):
+        row: Dict[str, object] = {
+            "channel_norm": key,
+            "channel": g["channel"].iloc[0],
+            "band": band,
+        }
+        for _, r in g.iterrows():
+            cond = str(r["condition"]).lower()
+            row[f"bandpower_{cond}_mean"] = r["bandpower_mean"]
+            row[f"bandpower_{cond}_sem"] = r["bandpower_sem"]
+            row[f"bandpower_rel_{cond}_mean"] = r["bandpower_rel_mean"]
+            row[f"bandpower_rel_{cond}_sem"] = r["bandpower_rel_sem"]
+            row[f"n_subjects_{cond}"] = r["n_subjects"]
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    return out.sort_values(["channel_norm", "band"])
+
+# -----------------------------
+# Plotting (3 figure story)
+# -----------------------------
+def save_caption(out_dir: str, fname: str, text: str, cfg: Config):
+    if not cfg.SAVE_CAPTIONS:
+        return
+    with open(os.path.join(out_dir, fname), "w", encoding="utf-8") as f:
+        f.write(text.strip() + "\n")
+
+def fig1_mse_curves(out_dir: str, title: str, rest: np.ndarray, mi: np.ndarray, me: np.ndarray,
+                   cfg: Config, suffix: str):
+    """
+    rest/mi/me: (n_subj, n_scales)
+    """
+    scales = np.arange(1, cfg.MSE_SCALES + 1)
+    rest_m, mi_m, me_m = np.nanmean(rest, axis=0), np.nanmean(mi, axis=0), np.nanmean(me, axis=0)
+    rest_sem, mi_sem, me_sem = sem(rest, axis=0), sem(mi, axis=0), sem(me, axis=0)
+
+    plt.figure(figsize=(8.2, 5.2))
+    plt.plot(scales, rest_m, lw=2.8, color=cfg.COLOR_REST, label="REST")
+    plt.fill_between(scales, rest_m - rest_sem, rest_m + rest_sem, color=cfg.COLOR_REST, alpha=0.15)
+
+    plt.plot(scales, mi_m, lw=2.8, color=cfg.COLOR_MI, label="MI")
+    plt.fill_between(scales, mi_m - mi_sem, mi_m + mi_sem, color=cfg.COLOR_MI, alpha=0.15)
+
+    plt.plot(scales, me_m, lw=2.8, color=cfg.COLOR_ME, label="ME")
+    plt.fill_between(scales, me_m - me_sem, me_m + me_sem, color=cfg.COLOR_ME, alpha=0.15)
+
+    plt.title(title)
+    plt.xlabel("MSE scale")
+    plt.ylabel("Multiscale entropy (SampEn on coarse-grained signal)")
+    plt.xticks(scales)
+    plt.legend(frameon=False)
+    plt.tight_layout()
+    out_path = os.path.join(out_dir, f"Fig1_MSE_curves_{suffix}.png")
+    plt.savefig(out_path, dpi=cfg.FIG_DPI)
+    plt.close()
+
+    within_subj = (
+        "Within each subject, MSE is computed on each 10 s epoch and then averaged across epochs."
+        if cfg.ENTROPY_PER_EPOCH
+        else "Within each subject, epochs are averaged to one trace per channel before MSE."
+    )
+    cap = (
+        f"Figure 1 ({suffix}): Multiscale entropy (MSE) across scales for REST (R01 eyes open), "
+        f"motor imagery (MI; runs {cfg.MI_RUNS}), and motor execution (ME; runs {cfg.ME_RUNS}). "
+        f"Lines show mean across subjects; shaded bands are ±SEM. "
+        f"MSE computed via coarse-graining (scale 1–{cfg.MSE_SCALES}) followed by Sample Entropy. "
+        f"{within_subj}"
+    )
+    save_caption(out_dir, f"Fig1_MSE_curves_{suffix}_caption.txt", cap, cfg)
+
+def fig2_mi_minus_me_dots(out_dir: str, title: str, mi: np.ndarray, me: np.ndarray, cfg: Config, suffix: str):
+    """
+    MI-ME paired differences by scale.
+    """
+    scales = np.arange(1, cfg.MSE_SCALES + 1)
+    diff = mi - me  # (n_subj, n_scales)
+    plt.figure(figsize=(8.2, 5.2))
+
+    # jittered dots per scale
+    rng = np.random.default_rng(0)
+    for i, s in enumerate(scales):
+        y = diff[:, i]
+        mask = np.isfinite(y)
+        x = np.full(mask.sum(), s) + rng.normal(0, 0.06, size=mask.sum())
+        plt.scatter(x, y[mask], s=18, color="black", alpha=0.25)
+
+        # mean ± SEM overlay (black)
+        m = np.nanmean(y)
+        e = sem(y, axis=0)
+        plt.errorbar([s], [m], yerr=[e], fmt="o", color="black", capsize=4, markersize=7)
+
+    plt.axhline(0, ls="--", lw=1.6, color=cfg.COLOR_MI)
+    plt.title(title)
+    plt.xlabel("MSE scale")
+    plt.ylabel("MI − ME (MSE)")
+    plt.xticks(scales)
+    plt.tight_layout()
+    out_path = os.path.join(out_dir, f"Fig2_MI_minus_ME_dots_{suffix}.png")
+    plt.savefig(out_path, dpi=cfg.FIG_DPI)
+    plt.close()
+
+    cap = (
+        f"Figure 2 ({suffix}): Within-subject paired differences (MI − ME) in MSE by scale. "
+        f"Each dot is one subject; black marker shows mean ± SEM. "
+        f"Positive values indicate higher complexity during MI than ME."
+    )
+    save_caption(out_dir, f"Fig2_MI_minus_ME_dots_{suffix}_caption.txt", cap, cfg)
+
+def fig3_sampen_bars(out_dir: str, title: str, rest: np.ndarray, mi: np.ndarray, me: np.ndarray,
+                    cfg: Config, suffix: str):
+    """
+    SampEn bars for rest/mi/me.
+    Inputs are vectors (n_subj,)
+    """
+    means = [np.nanmean(rest), np.nanmean(mi), np.nanmean(me)]
+    errs = [sem(rest), sem(mi), sem(me)]
+    labels = ["Rest", "MI", "ME"]
+    colors = [cfg.COLOR_REST, cfg.COLOR_MI, cfg.COLOR_ME]
+
+    plt.figure(figsize=(6.8, 5.2))
+    plt.bar(labels, means, yerr=errs, capsize=6, color=colors, edgecolor="none")
+    plt.title(title)
+    plt.ylabel("Sample entropy")
+    plt.tight_layout()
+    out_path = os.path.join(out_dir, f"Fig3_SampEn_bars_{suffix}.png")
+    plt.savefig(out_path, dpi=cfg.FIG_DPI)
+    plt.close()
+
+    samp_subj = (
+        "Within each subject, SampEn is computed per epoch and averaged across epochs."
+        if cfg.ENTROPY_PER_EPOCH
+        else "Within each subject, epochs are averaged before SampEn."
+    )
+    cap = (
+        f"Figure 3 ({suffix}): Single-scale Sample Entropy (SampEn) for REST, MI, and ME. "
+        f"Bars show mean ± SEM across subjects. {samp_subj}"
+    )
+    save_caption(out_dir, f"Fig3_SampEn_bars_{suffix}_caption.txt", cap, cfg)
+
+# -----------------------------
+# Main pipeline
+# -----------------------------
+def run_pipeline(cfg: Config) -> Dict[str, object]:
+    out_dir = os.path.join(cfg.DATASET_ROOT, cfg.OUT_DIR_NAME)
+    os.makedirs(out_dir, exist_ok=True)
+
+    subs = subject_ids(cfg)
+
+    if not cfg.COMPUTE_ROI:
+        print(
+            "[INFO] COMPUTE_ROI=False: ROI summaries, ROI figures, ROI p-values, and ROI MSE CSVs omitted or NaN."
+        )
+
+    # Store per-subject results
+    rows = []
+
+    # We also store per-subject MSE curves (whole + ROI)
+    mse_rest_whole, mse_mi_whole, mse_me_whole = [], [], []
+    mse_rest_roi,   mse_mi_roi,   mse_me_roi   = [], [], []
+
+    samp_rest_whole, samp_mi_whole, samp_me_whole = [], [], []
+    samp_rest_roi,   samp_mi_roi,   samp_me_roi   = [], [], []
+
+    perm_rest_whole, perm_mi_whole, perm_me_whole = [], [], []
+    perm_rest_roi,   perm_mi_roi,   perm_me_roi   = [], [], []
+
+    roi_idx_ref = None
+    roi_found_ref = None
+    roi_missing_ref = None
+
+    sampen_validation_rows: List[Dict[str, object]] = []
+    val_rng = np.random.default_rng(cfg.SAMPEN_VALIDATION_RNG_SEED)
+
+    nj_ent = _resolve_entropy_n_jobs(cfg)
+    if cfg.ENTROPY_N_JOBS != 1 and nj_ent == 1 and Parallel is None:
+        print("[WARN] ENTROPY_N_JOBS>1 needs joblib (pip install joblib). Using one worker.")
+    if cfg.SAMPEN_USE_ANTROPY and _antropy_sample_entropy is None:
+        print(
+            "[WARN] pip install antropy — SampEn uses a slow fallback; optional antropy validation CSV is off."
+        )
+
+    # (subject, ch_names, rest_vec, mi_vec, me_vec) for per-electrode CSV
+    per_subject_sampen_by_ch: List[Tuple[str, List[str], np.ndarray, np.ndarray, np.ndarray]] = []
+    # (subject, ch_names, band_names, abs_rest, abs_mi, abs_me, rel_rest, rel_mi, rel_me)
+    per_subject_fft_bandpower_by_ch: List[
+        Tuple[str, List[str], List[str], np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    ] = []
+
+    for subj in tqdm(subs, desc="Subjects"):
+        rest_epochs, mi_epochs, me_epochs, subj_ch_names, subj_sfreq = load_subject_epochs(cfg, subj)
+
+        # ROI indices from first subject that yields channel names (only if ROI analysis enabled)
+        if cfg.COMPUTE_ROI and roi_idx_ref is None and subj_ch_names:
+            roi_idx_ref, roi_found_ref, roi_missing_ref = pick_roi_indices(subj_ch_names, cfg.ROI_ELECTRODES)
+
+        # If we never loaded any raw for this subject, skip
+        if (len(rest_epochs) == 0) and (len(mi_epochs) == 0) and (len(me_epochs) == 0):
+            continue
+        if cfg.INCLUSION_ENABLE and not subject_passes_inclusion(rest_epochs, mi_epochs, me_epochs, cfg):
+            continue
+
+        sampen_validation_rows.extend(
+            collect_sampen_antropy_validation(
+                subj,
+                rest_epochs,
+                mi_epochs,
+                me_epochs,
+                subj_ch_names if subj_ch_names is not None else [],
+                cfg,
+                val_rng,
+            )
+        )
+
+        # Per-channel MSE / SampEn / PermEn: one pass per condition (reuse SampEn for CSV + scalars)
+        mse_r_ch, samp_r_ch, perm_r_ch = entropy_per_channel_from_epochs(rest_epochs, cfg)
+        mse_mi_ch, samp_mi_ch, perm_mi_ch = entropy_per_channel_from_epochs(mi_epochs, cfg)
+        mse_me_ch, samp_me_ch, perm_me_ch = entropy_per_channel_from_epochs(me_epochs, cfg)
+
+        # Whole-scalp and ROI scalars (mean across channels; ROI = subset by index)
+        mse_r_w, samp_r_w, perm_r_w = _mean_entropy_scalars(
+            mse_r_ch, samp_r_ch, perm_r_ch, None, cfg
+        )
+        mse_mi_w, samp_mi_w, perm_mi_w = _mean_entropy_scalars(
+            mse_mi_ch, samp_mi_ch, perm_mi_ch, None, cfg
+        )
+        mse_me_w, samp_me_w, perm_me_w = _mean_entropy_scalars(
+            mse_me_ch, samp_me_ch, perm_me_ch, None, cfg
+        )
+
+        if cfg.COMPUTE_ROI:
+            mse_r_roi, samp_r_roi, perm_r_roi = _mean_entropy_scalars(
+                mse_r_ch, samp_r_ch, perm_r_ch, roi_idx_ref, cfg
+            )
+            mse_mi_roi_v, samp_mi_roi_v, perm_mi_roi_v = _mean_entropy_scalars(
+                mse_mi_ch, samp_mi_ch, perm_mi_ch, roi_idx_ref, cfg
+            )
+            mse_me_roi_v, samp_me_roi_v, perm_me_roi_v = _mean_entropy_scalars(
+                mse_me_ch, samp_me_ch, perm_me_ch, roi_idx_ref, cfg
+            )
+        else:
+            _zr = _nan_entropy_roi_scalars(cfg)
+            mse_r_roi, samp_r_roi, perm_r_roi = _zr
+            mse_mi_roi_v, samp_mi_roi_v, perm_mi_roi_v = _zr
+            mse_me_roi_v, samp_me_roi_v, perm_me_roi_v = _zr
+
+        # Per-electrode SampEn: same vectors as entropy_per_channel_from_epochs (no duplicate SampEn)
+        if subj_ch_names:
+            n_ch = len(subj_ch_names)
+            sr_ch = samp_r_ch if samp_r_ch.size == n_ch else np.full(n_ch, np.nan)
+            smi_ch = samp_mi_ch if samp_mi_ch.size == n_ch else np.full(n_ch, np.nan)
+            sme_ch = samp_me_ch if samp_me_ch.size == n_ch else np.full(n_ch, np.nan)
+        else:
+            sr_ch = smi_ch = sme_ch = np.array([])
+
+        if subj_ch_names and sr_ch.size == len(subj_ch_names):
+            per_subject_sampen_by_ch.append((subj, list(subj_ch_names), sr_ch, smi_ch, sme_ch))
+
+        # Per-electrode FFT band power (whole scalp), condition-averaged signal
+        if subj_ch_names and subj_sfreq is not None:
+            n_ch = len(subj_ch_names)
+            n_bands = len(cfg.FFT_BANDS)
+            br_ch, rr_ch = fft_bandpower_per_channel_from_epochs(rest_epochs, subj_ch_names, subj_sfreq, cfg)
+            bmi_ch, rmi_ch = fft_bandpower_per_channel_from_epochs(mi_epochs, subj_ch_names, subj_sfreq, cfg)
+            bme_ch, rme_ch = fft_bandpower_per_channel_from_epochs(me_epochs, subj_ch_names, subj_sfreq, cfg)
+            if br_ch.shape != (n_ch, n_bands):
+                br_ch = np.full((n_ch, n_bands), np.nan)
+            if rr_ch.shape != (n_ch, n_bands):
+                rr_ch = np.full((n_ch, n_bands), np.nan)
+            if bmi_ch.shape != (n_ch, n_bands):
+                bmi_ch = np.full((n_ch, n_bands), np.nan)
+            if rmi_ch.shape != (n_ch, n_bands):
+                rmi_ch = np.full((n_ch, n_bands), np.nan)
+            if bme_ch.shape != (n_ch, n_bands):
+                bme_ch = np.full((n_ch, n_bands), np.nan)
+            if rme_ch.shape != (n_ch, n_bands):
+                rme_ch = np.full((n_ch, n_bands), np.nan)
+            per_subject_fft_bandpower_by_ch.append(
+                (
+                    subj,
+                    list(subj_ch_names),
+                    [b[0] for b in cfg.FFT_BANDS],
+                    br_ch,
+                    bmi_ch,
+                    bme_ch,
+                    rr_ch,
+                    rmi_ch,
+                    rme_ch,
+                )
+            )
+
+        # Save to group arrays
+        mse_rest_whole.append(mse_r_w); mse_mi_whole.append(mse_mi_w); mse_me_whole.append(mse_me_w)
+        mse_rest_roi.append(mse_r_roi); mse_mi_roi.append(mse_mi_roi_v); mse_me_roi.append(mse_me_roi_v)
+
+        samp_rest_whole.append(samp_r_w); samp_mi_whole.append(samp_mi_w); samp_me_whole.append(samp_me_w)
+        samp_rest_roi.append(samp_r_roi); samp_mi_roi.append(samp_mi_roi_v); samp_me_roi.append(samp_me_roi_v)
+
+        perm_rest_whole.append(perm_r_w); perm_mi_whole.append(perm_mi_w); perm_me_whole.append(perm_me_w)
+        perm_rest_roi.append(perm_r_roi); perm_mi_roi.append(perm_mi_roi_v); perm_me_roi.append(perm_me_roi_v)
+
+        rows.append({
+            "subject": subj,
+            "n_rest_epochs": len(rest_epochs),
+            "n_mi_epochs": len(mi_epochs),
+            "n_me_epochs": len(me_epochs),
+            "sampen_rest_whole": samp_r_w,
+            "sampen_mi_whole": samp_mi_w,
+            "sampen_me_whole": samp_me_w,
+            "permen_rest_whole": perm_r_w,
+            "permen_mi_whole": perm_mi_w,
+            "permen_me_whole": perm_me_w,
+            "sampen_rest_roi": samp_r_roi,
+            "sampen_mi_roi": samp_mi_roi_v,
+            "sampen_me_roi": samp_me_roi_v,
+            "permen_rest_roi": perm_r_roi,
+            "permen_mi_roi": perm_mi_roi_v,
+            "permen_me_roi": perm_me_roi_v,
+        })
+
+    # Convert to arrays
+    mse_rest_whole = np.asarray(mse_rest_whole, dtype=float)
+    mse_mi_whole   = np.asarray(mse_mi_whole, dtype=float)
+    mse_me_whole   = np.asarray(mse_me_whole, dtype=float)
+
+    mse_rest_roi = np.asarray(mse_rest_roi, dtype=float)
+    mse_mi_roi   = np.asarray(mse_mi_roi, dtype=float)
+    mse_me_roi   = np.asarray(mse_me_roi, dtype=float)
+
+    samp_rest_whole = np.asarray(samp_rest_whole, dtype=float)
+    samp_mi_whole   = np.asarray(samp_mi_whole, dtype=float)
+    samp_me_whole   = np.asarray(samp_me_whole, dtype=float)
+
+    samp_rest_roi = np.asarray(samp_rest_roi, dtype=float)
+    samp_mi_roi   = np.asarray(samp_mi_roi, dtype=float)
+    samp_me_roi   = np.asarray(samp_me_roi, dtype=float)
+
+    perm_rest_whole = np.asarray(perm_rest_whole, dtype=float)
+    perm_mi_whole   = np.asarray(perm_mi_whole, dtype=float)
+    perm_me_whole   = np.asarray(perm_me_whole, dtype=float)
+
+    perm_rest_roi = np.asarray(perm_rest_roi, dtype=float)
+    perm_mi_roi   = np.asarray(perm_mi_roi, dtype=float)
+    perm_me_roi   = np.asarray(perm_me_roi, dtype=float)
+
+    # Subject summary CSV
+    df_subj = pd.DataFrame(rows)
+    df_subj.to_csv(os.path.join(out_dir, "subject_summary.csv"), index=False)
+
+    # Per-electrode SampEn: long + wide CSVs
+    if cfg.SAVE_SAMPEN_PER_ELECTRODE_CSV and per_subject_sampen_by_ch:
+        df_e_long = aggregate_sampen_by_electrode(per_subject_sampen_by_ch)
+        df_e_long.to_csv(
+            os.path.join(out_dir, "sampen_per_electrode_by_condition_long.csv"),
+            index=False,
+        )
+        df_e_wide = sampen_per_electrode_wide_csv(df_e_long)
+        df_e_wide.to_csv(os.path.join(out_dir, cfg.SAMPEN_PER_ELECTRODE_CSV_NAME), index=False)
+
+    # Per-electrode FFT band power: long + wide CSVs
+    if cfg.SAVE_FFT_BANDPOWER_PER_ELECTRODE_CSV and per_subject_fft_bandpower_by_ch:
+        df_bp_long = aggregate_fft_bandpower_by_electrode(per_subject_fft_bandpower_by_ch)
+        df_bp_long.to_csv(
+            os.path.join(out_dir, "fft_bandpower_per_electrode_by_condition_long.csv"),
+            index=False,
+        )
+        df_bp_wide = fft_bandpower_per_electrode_wide_csv(df_bp_long)
+        df_bp_wide.to_csv(
+            os.path.join(out_dir, cfg.FFT_BANDPOWER_PER_ELECTRODE_CSV_NAME),
+            index=False,
+        )
+
+    # Save ROI matching report (only when ROI analysis ran)
+    if cfg.COMPUTE_ROI:
+        if roi_idx_ref is None:
+            roi_idx_ref, roi_found_ref, roi_missing_ref = [], [], CFG.ROI_ELECTRODES
+
+        roi_report = pd.DataFrame({
+            "roi_requested": CFG.ROI_ELECTRODES,
+            "found_in_data": [name in (roi_found_ref or []) for name in CFG.ROI_ELECTRODES]
+        })
+        roi_report.to_csv(os.path.join(out_dir, "roi_channel_match_report.csv"), index=False)
+
+        print("\n=== ROI channel matching ===")
+        print("Requested ROI:", CFG.ROI_ELECTRODES)
+        print("Found ROI:", roi_found_ref)
+        print("Missing ROI:", roi_missing_ref)
+        print(f"ROI channels used: {len(roi_idx_ref)}")
+    else:
+        pd.DataFrame({"note": ["ROI analysis disabled (COMPUTE_ROI=False)"]}).to_csv(
+            os.path.join(out_dir, "roi_channel_match_report.csv"), index=False
+        )
+
+    # -----------------------------
+    # Save MSE curve-by-scale CSVs
+    # -----------------------------
+    scales = np.arange(1, cfg.MSE_SCALES + 1)
+    def save_curve(name: str, arr: np.ndarray):
+        df = pd.DataFrame({"scale": scales, "mean": np.nanmean(arr, axis=0), "sem": sem(arr, axis=0)})
+        df.to_csv(os.path.join(out_dir, name), index=False)
+
+    save_curve("mse_REST_curve_by_scale_whole.csv", mse_rest_whole)
+    save_curve("mse_MI_curve_by_scale_whole.csv", mse_mi_whole)
+    save_curve("mse_ME_curve_by_scale_whole.csv", mse_me_whole)
+
+    if cfg.COMPUTE_ROI:
+        save_curve("mse_REST_curve_by_scale_roi.csv", mse_rest_roi)
+        save_curve("mse_MI_curve_by_scale_roi.csv", mse_mi_roi)
+        save_curve("mse_ME_curve_by_scale_roi.csv", mse_me_roi)
+
+    # -----------------------------
+    # Paired p-values by scale (MI vs ME)
+    # -----------------------------
+    # Use subjects where both MI and ME are finite at a scale
+    p_whole = paired_pvals_by_scale(mse_mi_whole, mse_me_whole)
+    if cfg.COMPUTE_ROI:
+        p_roi = paired_pvals_by_scale(mse_mi_roi, mse_me_roi)
+    else:
+        p_roi = np.full_like(p_whole, np.nan, dtype=float)
+    if cfg.APPLY_FDR_TO_MI_VS_ME_PVALS:
+        fdr_whole = benjamini_hochberg_fdr(p_whole)
+        fdr_roi = benjamini_hochberg_fdr(p_roi) if cfg.COMPUTE_ROI else np.full_like(p_whole, np.nan)
+    else:
+        fdr_whole = np.full_like(p_whole, np.nan)
+        fdr_roi = np.full_like(p_whole, np.nan)
+
+    pd.DataFrame({
+        "scale": scales,
+        "p_MI_vs_ME_whole": p_whole,
+        "p_MI_vs_ME_whole_fdr_bh": fdr_whole,
+        "p_MI_vs_ME_roi": p_roi,
+        "p_MI_vs_ME_roi_fdr_bh": fdr_roi,
+    }).to_csv(os.path.join(out_dir, "pvals_MI_vs_ME_by_scale.csv"), index=False)
+    if cfg.APPLY_FDR_TO_MI_VS_ME_PVALS:
+        fam = "whole scalp scales" + ("; ROI scales" if cfg.COMPUTE_ROI else "")
+        print(
+            f"[INFO] MI vs ME p-values: Benjamini–Hochberg FDR ({fam}). "
+            "See p_MI_vs_ME_*_fdr_bh columns."
+        )
+
+    if sampen_validation_rows:
+        df_val = pd.DataFrame(sampen_validation_rows)
+        df_val.to_csv(os.path.join(out_dir, "sampen_validation_antropy_vs_custom.csv"), index=False)
+        ad = df_val["abs_diff"].to_numpy(dtype=float)
+        ad = ad[np.isfinite(ad)]
+        if ad.size:
+            print(
+                f"\n=== SampEn validation (antropy vs custom, n={ad.size}) ===\n"
+                f"  mean |diff| = {float(np.mean(ad)):.6g}; max |diff| = {float(np.max(ad)):.6g}"
+            )
+
+    # -----------------------------
+    # Figures (WHOLE + ROI)
+    # -----------------------------
+    if cfg.MAKE_FIGURES:
+        # Figure 1: MSE curves (REST/MI/ME)
+        fig1_mse_curves(
+            out_dir,
+            "Multiscale Entropy vs Scale (Whole scalp)",
+            mse_rest_whole, mse_mi_whole, mse_me_whole,
+            cfg, suffix="whole"
+        )
+        if cfg.COMPUTE_ROI:
+            fig1_mse_curves(
+                out_dir,
+                "Multiscale Entropy vs Scale (Sensorimotor+context ROI)",
+                mse_rest_roi, mse_mi_roi, mse_me_roi,
+                cfg, suffix="roi"
+            )
+
+        # Figure 2: MI − ME paired dots
+        fig2_mi_minus_me_dots(
+            out_dir,
+            "Paired MI − ME Differences by MSE Scale (Whole scalp)",
+            mse_mi_whole, mse_me_whole,
+            cfg, suffix="whole"
+        )
+        if cfg.COMPUTE_ROI:
+            fig2_mi_minus_me_dots(
+                out_dir,
+                "Paired MI − ME Differences by MSE Scale (Sensorimotor+context ROI)",
+                mse_mi_roi, mse_me_roi,
+                cfg, suffix="roi"
+            )
+
+        # Figure 3: SampEn bars (REST/MI/ME)
+        fig3_sampen_bars(
+            out_dir,
+            "Sample Entropy (single-scale) Across Conditions (Whole scalp)",
+            samp_rest_whole, samp_mi_whole, samp_me_whole,
+            cfg, suffix="whole"
+        )
+        if cfg.COMPUTE_ROI:
+            fig3_sampen_bars(
+                out_dir,
+                "Sample Entropy (single-scale) Across Conditions (Sensorimotor+context ROI)",
+                samp_rest_roi, samp_mi_roi, samp_me_roi,
+                cfg, suffix="roi"
+            )
+
+    # PermEn summary CSV (only when PermEn was computed)
+    if cfg.COMPUTE_PERMEN:
+        perm_df = pd.DataFrame({
+            "measure": ["PermEn_rest_whole", "PermEn_mi_whole", "PermEn_me_whole",
+                        "PermEn_rest_roi", "PermEn_mi_roi", "PermEn_me_roi"],
+            "mean": [np.nanmean(perm_rest_whole), np.nanmean(perm_mi_whole), np.nanmean(perm_me_whole),
+                     np.nanmean(perm_rest_roi), np.nanmean(perm_mi_roi), np.nanmean(perm_me_roi)],
+            "sem":  [sem(perm_rest_whole), sem(perm_mi_whole), sem(perm_me_whole),
+                     sem(perm_rest_roi), sem(perm_mi_roi), sem(perm_me_roi)]
+        })
+        perm_df.to_csv(os.path.join(out_dir, "permen_summary_whole_and_roi.csv"), index=False)
+
+    print(f"\nPipeline finished successfully.\nOutput directory: {out_dir}")
+    return {
+        "out_dir": out_dir,
+        "roi_idx": roi_idx_ref,
+        "roi_found": roi_found_ref,
+        "roi_missing": roi_missing_ref,
+    }
+
+def main() -> None:
+    # Optional: export EEGMMIDB_ROOT=/your/path before running so you do not edit the file.
+    root = os.environ.get("EEGMMIDB_ROOT", "").strip()
+    if root:
+        CFG.DATASET_ROOT = root
+    if not os.path.isdir(CFG.DATASET_ROOT):
+        raise ValueError(
+            f"DATASET_ROOT is not a directory: {CFG.DATASET_ROOT!r}\n"
+            "Set Config.DATASET_ROOT to your EEGMMIDB folder, or set the EEGMMIDB_ROOT environment variable."
+        )
+    run_pipeline(CFG)
+
+if __name__ == "__main__":
+    main()
