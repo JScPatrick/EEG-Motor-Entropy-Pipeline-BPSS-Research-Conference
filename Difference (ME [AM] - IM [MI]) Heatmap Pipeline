@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""
+Difference topomap: Sample Entropy (ME − MI) per electrode.
+
+Shows how SampEn changes from motor imagery → motor execution. Symmetric scale around 0.
+
+Default colormap:
+  • No change (0) = white
+  • Positive (ME > MI): entropy higher at execution — yellow → red
+  • Negative (ME < MI): entropy lower at execution — green → purple
+
+Input: wide CSV sampen_per_electrode_mean_across_subjects.csv
+       (columns: channel or channel_norm, sampen_mi_mean, sampen_me_mean)
+
+Usage:
+  python plot_sampen_difference_topomap_mi_minus_me.py /path/to/sampen_per_electrode_mean_across_subjects.csv
+  python plot_sampen_difference_topomap_mi_minus_me.py --csv /path/to/file.csv -o diff_topomap.png
+
+Or set DEFAULT_CSV_PATH / DEFAULT_OUT_PATH below for PyCharm Run without CLI args.
+
+Requires: mne, matplotlib, pandas, numpy.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from typing import List, Optional, Tuple, Union
+
+# =============================================================================
+# EDIT HERE (optional): PyCharm Run without CLI arguments.
+# =============================================================================
+DEFAULT_CSV_PATH: Optional[str] = None
+DEFAULT_OUT_PATH: Optional[str] = None
+DEFAULT_MONTAGE: str = "standard_1020"
+DEFAULT_CMAP: str = "me_mi_diff"
+
+import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
+import mne
+import numpy as np
+import pandas as pd
+
+MONTAGE_CANDIDATES = ("standard_1020", "biosemi64", "standard_1005")
+
+# Diverging map: negative (ME<MI) → purple…green, zero → white, positive (ME>MI) → yellow…red
+_ME_MI_DIFF_CMAP = mcolors.LinearSegmentedColormap.from_list(
+    "me_mi_diff",
+    [
+        "#4a148c",  # purple (strong drop in entropy at ME vs MI)
+        "#66bb6a",  # green
+        "#ffffff",  # no change
+        "#fdd835",  # yellow
+        "#b71c1c",  # red (strong rise at ME vs MI)
+    ],
+    N=256,
+)
+
+
+def resolve_difference_cmap(name: str) -> Union[mcolors.Colormap, str]:
+    """Built-in diverging map, or any matplotlib colormap name."""
+    key = (name or "me_mi_diff").strip().lower()
+    if key in ("me_mi_diff", "mi_me_diff", "diverging", "default"):
+        return _ME_MI_DIFF_CMAP
+    return name
+
+
+def _norm_ch_key(name: str) -> str:
+    if name is None:
+        return ""
+    x = str(name).strip().upper()
+    x = re.sub(r"[\s\.\-_/]", "", x)
+    return x
+
+
+def _pick_montage_and_canonical_names(
+    raw_names: List[str], preference: str
+) -> Tuple[mne.channels.DigMontage, str, List[str]]:
+    order = ([preference] if preference else []) + [
+        m for m in MONTAGE_CANDIDATES if m != preference
+    ]
+    tried: List[str] = []
+    best: Tuple[int, str, mne.channels.DigMontage, List[str], List[str]] | None = None
+    for montage_name in order:
+        if montage_name in tried:
+            continue
+        tried.append(montage_name)
+        try:
+            montage = mne.channels.make_standard_montage(montage_name)
+        except Exception:
+            continue
+        lookup = {_norm_ch_key(ch): ch for ch in montage.ch_names}
+        canonical: List[str] = []
+        missing: List[str] = []
+        for r in raw_names:
+            k = _norm_ch_key(r)
+            if k in lookup:
+                canonical.append(lookup[k])
+            else:
+                canonical.append(str(r))
+                missing.append(r)
+        n_ok = len(raw_names) - len(missing)
+        if best is None or n_ok > best[0]:
+            best = (n_ok, montage_name, montage, canonical, missing)
+        if not missing:
+            return montage, montage_name, canonical
+
+    assert best is not None
+    n_ok, montage_name, montage, canonical, missing = best
+    if missing:
+        sample = ", ".join(repr(x) for x in missing[:8])
+        raise RuntimeError(
+            "Could not map all CSV channel names to a standard montage. "
+            f"Montage {montage_name!r} matched {n_ok}/{len(raw_names)} channels. "
+            f"Unmapped examples: {sample}."
+        )
+    return montage, montage_name, canonical
+
+
+def _apply_montage(
+    info: mne.Info, montage: mne.channels.DigMontage, montage_name: str
+) -> Tuple[mne.Info, str]:
+    raw = mne.io.RawArray(np.zeros((info["nchan"], 100)), info.copy())
+    raw.set_montage(montage, match_case=False, on_missing="raise")
+    return raw.info, montage_name
+
+
+def _finite_topomap_data(values: np.ndarray) -> Tuple[np.ndarray, bool]:
+    had_nan = bool(np.any(~np.isfinite(values)))
+    v = values.astype(float).copy()
+    med = float(np.nanmedian(v))
+    if not np.isfinite(med):
+        med = 0.0
+    v[~np.isfinite(v)] = med
+    return v, had_nan
+
+
+def plot_sampen_me_minus_mi_difference_topomap(
+    csv_path: str,
+    out_path: str,
+    montage: str = "standard_1020",
+    cmap: str = "me_mi_diff",
+) -> None:
+    df = pd.read_csv(csv_path)
+    if "channel_norm" in df.columns:
+        ch_col = "channel_norm"
+    elif "channel" in df.columns:
+        ch_col = "channel"
+    else:
+        raise SystemExit(f"Need 'channel' or 'channel_norm'. Columns: {list(df.columns)}")
+    for c in ("sampen_mi_mean", "sampen_me_mean"):
+        if c not in df.columns:
+            raise SystemExit(
+                f"Missing column {c!r}. Use sampen_per_electrode_mean_across_subjects.csv. "
+                f"Columns: {list(df.columns)}"
+            )
+
+    raw_names = df[ch_col].astype(str).str.strip().tolist()
+    montage_obj, used_montage, canonical_names = _pick_montage_and_canonical_names(
+        raw_names, montage
+    )
+    if len(set(canonical_names)) != len(canonical_names):
+        raise RuntimeError(
+            "Duplicate montage electrodes after name normalization. Check CSV. "
+            f"Names: {canonical_names!r}"
+        )
+
+    mi = pd.to_numeric(df["sampen_mi_mean"], errors="coerce").to_numpy(dtype=float)
+    me = pd.to_numeric(df["sampen_me_mean"], errors="coerce").to_numpy(dtype=float)
+    diff = me - mi
+    finite_mask = np.isfinite(mi) & np.isfinite(me)
+    if finite_mask.any():
+        abs_max = float(np.nanmax(np.abs(diff[finite_mask])))
+    else:
+        abs_max = 0.0
+
+    info = mne.create_info(canonical_names, sfreq=256.0, ch_types="eeg")
+    info, used_montage = _apply_montage(info, montage_obj, used_montage)
+
+    plot_vals, had_nan = _finite_topomap_data(diff)
+    if not np.isfinite(abs_max) or abs_max <= 0:
+        vlim = None
+    else:
+        vlim = (-abs_max, abs_max)
+
+    cmap_resolved = resolve_difference_cmap(cmap)
+
+    fig, ax = plt.subplots(figsize=(5.5, 4.5))
+    im, _ = mne.viz.plot_topomap(
+        plot_vals,
+        info,
+        axes=ax,
+        show=False,
+        cmap=cmap_resolved,
+        vlim=vlim,
+        contours=6,
+    )
+    ax.set_title("SampEn difference (ME − MI)", fontsize=13)
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Δ SampEn (ME − MI)")
+    note = (
+        f"White ≈ no change; yellow–red = higher SampEn at ME; green–purple = lower at ME (vs MI).  "
+        f"Montage: {used_montage}  |  {os.path.basename(csv_path)}"
+    )
+    if had_nan:
+        note += "  |  NaN replaced with median for display."
+    fig.suptitle(note, fontsize=9, y=1.06)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"Saved: {out_path}")
+
+
+def _resolve_input_paths(args: argparse.Namespace) -> Tuple[str, str, str, str]:
+    """Resolve CSV/output/montage/cmap from defaults + CLI with safety guards."""
+    if DEFAULT_CSV_PATH:
+        csv_path = DEFAULT_CSV_PATH
+        out_path = DEFAULT_OUT_PATH or "sampen_difference_topomap_me_minus_mi.png"
+        montage, cmap = DEFAULT_MONTAGE, DEFAULT_CMAP
+        # Allow non-sensitive plotting overrides from CLI when default CSV is set.
+        if args.out:
+            out_path = args.out
+        if args.montage:
+            montage = args.montage
+        if args.cmap:
+            cmap = args.cmap
+    else:
+        csv_path = args.csv
+        out_path = args.out or "sampen_difference_topomap_me_minus_mi.png"
+        montage = args.montage or "standard_1020"
+        cmap = args.cmap or "me_mi_diff"
+
+    if not csv_path:
+        raise SystemExit(
+            "Missing CSV path. Pass a file path as positional argument or set DEFAULT_CSV_PATH."
+        )
+    if str(csv_path).strip() in {"", "/path/to/file.csv", "/path/to/sampen_per_electrode_mean_across_subjects.csv"}:
+        raise SystemExit(
+            "CSV path is still a template placeholder. "
+            "Set a real path via CLI or DEFAULT_CSV_PATH."
+        )
+    csv_path = os.path.abspath(os.path.expanduser(str(csv_path)))
+    out_path = os.path.abspath(os.path.expanduser(str(out_path)))
+    return csv_path, out_path, montage, cmap
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        description="Difference topomap: SampEn ME minus MI per electrode (imagery → execution)"
+    )
+    p.add_argument(
+        "csv",
+        nargs="?",
+        default=None,
+        help="Path to sampen_per_electrode_mean_across_subjects.csv",
+    )
+    p.add_argument(
+        "-o",
+        "--out",
+        default=None,
+        help="Output PNG path (default: sampen_difference_topomap_me_minus_mi.png in current directory)",
+    )
+    p.add_argument("--montage", default=None, help="Preferred MNE montage")
+    p.add_argument(
+        "--cmap",
+        default=None,
+        help="Colormap: me_mi_diff (white=0, yellow–red=ME>MI, green–purple=ME<MI), or any matplotlib name (e.g. jet)",
+    )
+    args = p.parse_args()
+
+    csv_path, out_path, montage, cmap = _resolve_input_paths(args)
+    if not os.path.isfile(csv_path):
+        raise SystemExit(f"File not found: {csv_path}")
+    if resolve_difference_cmap(cmap) == cmap:
+        # User requested a matplotlib colormap by name; validate up front.
+        try:
+            plt.get_cmap(cmap)
+        except Exception as e:
+            raise SystemExit(f"Invalid matplotlib colormap {cmap!r}: {e}") from e
+    print(
+        "[INFO] plot_sampen_difference_topomap "
+        f"csv={csv_path!r} out={out_path!r} montage={montage!r} cmap={cmap!r} diff='ME-MI'"
+    )
+
+    plot_sampen_me_minus_mi_difference_topomap(csv_path, out_path, montage=montage, cmap=cmap)
+
+
+if __name__ == "__main__":
+    main()
