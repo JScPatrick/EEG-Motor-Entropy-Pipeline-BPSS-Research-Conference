@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""
+Plot FFT band-power per-electrode scalp maps from the pipeline wide CSV.
+Does NOT re-run the full EEG pipeline.
+
+Input: fft_bandpower_per_electrode_mean_across_subjects.csv
+       (columns include channel_norm, band, bandpower_rest_mean, …)
+
+Same montage / channel naming behavior as plot_sampen_topomap_from_csv.py.
+
+Usage:
+  python plot_fft_bandpower_topomap_from_csv.py path/to/fft_bandpower_per_electrode_mean_across_subjects.csv -o alpha_topomap.png --band alpha
+  python plot_fft_bandpower_topomap_from_csv.py path/to/file.csv --all-bands -o fft_topomap.png
+     → writes fft_topomap_alpha.png, fft_topomap_beta.png, …
+
+Requires: mne, matplotlib, pandas, numpy (same env as your pipeline).
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from typing import List, Optional, Tuple
+
+# =============================================================================
+# EDIT HERE (optional): PyCharm Run without CLI arguments.
+# =============================================================================
+DEFAULT_CSV_PATH: Optional[str] = None
+DEFAULT_OUT_PATH: Optional[str] = None
+DEFAULT_BAND: str = "alpha"
+DEFAULT_ALL_BANDS: bool = False
+DEFAULT_RELATIVE: bool = False
+DEFAULT_MONTAGE: str = "standard_1020"
+DEFAULT_CMAP: str = "plasma"
+
+import matplotlib.pyplot as plt
+import mne
+import numpy as np
+import pandas as pd
+
+MONTAGE_CANDIDATES = ("standard_1020", "biosemi64", "standard_1005")
+
+
+def _norm_ch_key(name: str) -> str:
+    if name is None:
+        return ""
+    x = str(name).strip().upper()
+    x = re.sub(r"[\s\.\-_/]", "", x)
+    return x
+
+
+def _pick_montage_and_canonical_names(
+    raw_names: List[str], preference: str
+) -> Tuple[mne.channels.DigMontage, str, List[str]]:
+    order = ([preference] if preference else []) + [
+        m for m in MONTAGE_CANDIDATES if m != preference
+    ]
+    tried: List[str] = []
+    best: Tuple[int, str, mne.channels.DigMontage, List[str], List[str]] | None = None
+    for montage_name in order:
+        if montage_name in tried:
+            continue
+        tried.append(montage_name)
+        try:
+            montage = mne.channels.make_standard_montage(montage_name)
+        except Exception:
+            continue
+        lookup = {_norm_ch_key(ch): ch for ch in montage.ch_names}
+        canonical: List[str] = []
+        missing: List[str] = []
+        for r in raw_names:
+            k = _norm_ch_key(r)
+            if k in lookup:
+                canonical.append(lookup[k])
+            else:
+                canonical.append(str(r))
+                missing.append(r)
+        n_ok = len(raw_names) - len(missing)
+        if best is None or n_ok > best[0]:
+            best = (n_ok, montage_name, montage, canonical, missing)
+        if not missing:
+            return montage, montage_name, canonical
+
+    assert best is not None
+    n_ok, montage_name, montage, canonical, missing = best
+    if missing:
+        sample = ", ".join(repr(x) for x in missing[:8])
+        raise RuntimeError(
+            "Could not map all CSV channel names to a standard montage. "
+            f"Montage {montage_name!r} matched {n_ok}/{len(raw_names)} channels. "
+            f"Unmapped examples: {sample}."
+        )
+    return montage, montage_name, canonical
+
+
+def _apply_montage(
+    info: mne.Info, montage: mne.channels.DigMontage, montage_name: str
+) -> Tuple[mne.Info, str]:
+    raw = mne.io.RawArray(np.zeros((info["nchan"], 100)), info.copy())
+    raw.set_montage(montage, match_case=False, on_missing="raise")
+    return raw.info, montage_name
+
+
+def _finite_topomap_data(values: np.ndarray) -> Tuple[np.ndarray, bool]:
+    had_nan = bool(np.any(~np.isfinite(values)))
+    v = values.astype(float).copy()
+    med = float(np.nanmedian(v))
+    if not np.isfinite(med):
+        med = 0.0
+    v[~np.isfinite(v)] = med
+    return v, had_nan
+
+
+def _prepare_band_df(df: pd.DataFrame, band: str) -> pd.DataFrame:
+    if "band" not in df.columns:
+        raise SystemExit(f"Missing 'band' column. Columns: {list(df.columns)}")
+    b = str(band).strip().lower()
+    sub = df[df["band"].astype(str).str.strip().str.lower() == b].copy()
+    if sub.empty:
+        avail = sorted(df["band"].astype(str).unique().tolist())
+        raise SystemExit(f"No rows for band {band!r}. Available bands: {avail}")
+    key = "channel_norm" if "channel_norm" in sub.columns else "channel"
+    if key not in sub.columns:
+        raise SystemExit(f"Need 'channel' or 'channel_norm'. Columns: {list(sub.columns)}")
+    sub = sub.sort_values(key)
+    n_dup = sub[key].duplicated().sum()
+    if n_dup:
+        raise SystemExit(f"Duplicate rows for band {band!r} and same channel ({n_dup} duplicates).")
+    return sub
+
+
+def plot_fft_bandpower_topomaps(
+    csv_path: str,
+    out_path: str,
+    band: str,
+    relative: bool,
+    montage: str = "standard_1020",
+    cmap: str = "plasma",
+) -> None:
+    df = pd.read_csv(csv_path)
+    sub = _prepare_band_df(df, band)
+
+    if "channel_norm" in sub.columns:
+        ch_col = "channel_norm"
+    else:
+        ch_col = "channel"
+
+    if relative:
+        req = ["bandpower_rel_rest_mean", "bandpower_rel_mi_mean", "bandpower_rel_me_mean"]
+        cbar_label = "Relative band power (mean)"
+    else:
+        req = ["bandpower_rest_mean", "bandpower_mi_mean", "bandpower_me_mean"]
+        cbar_label = "Band power (mean)"
+
+    for c in req:
+        if c not in sub.columns:
+            raise SystemExit(
+                f"Missing column {c!r}. Use fft_bandpower_per_electrode_mean_across_subjects.csv "
+                f"from the pipeline. Columns found: {list(sub.columns)}"
+            )
+
+    raw_names = sub[ch_col].astype(str).str.strip().tolist()
+    montage_obj, used_montage, canonical_names = _pick_montage_and_canonical_names(
+        raw_names, montage
+    )
+    if len(set(canonical_names)) != len(canonical_names):
+        raise RuntimeError(
+            "Some channels map to the same montage electrode. "
+            f"Names: {canonical_names!r}"
+        )
+    info = mne.create_info(canonical_names, sfreq=256.0, ch_types="eeg")
+    info, used_montage = _apply_montage(info, montage_obj, used_montage)
+
+    conditions = [
+        ("REST", req[0]),
+        ("MI", req[1]),
+        ("ME", req[2]),
+    ]
+
+    stacked = np.concatenate(
+        [pd.to_numeric(sub[c], errors="coerce").to_numpy(dtype=float) for _, c in conditions]
+    )
+    g_min, g_max = float(np.nanmin(stacked)), float(np.nanmax(stacked))
+    if not np.isfinite(g_min) or not np.isfinite(g_max) or g_min == g_max:
+        vlim = None
+    else:
+        vlim = (g_min, g_max)
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+    any_nan_note = False
+    for ax, (title, col) in zip(axes, conditions):
+        raw_vals = pd.to_numeric(sub[col], errors="coerce").to_numpy(dtype=float)
+        plot_vals, had_nan = _finite_topomap_data(raw_vals)
+        any_nan_note = any_nan_note or had_nan
+
+        im, _ = mne.viz.plot_topomap(
+            plot_vals,
+            info,
+            axes=ax,
+            show=False,
+            cmap=cmap,
+            vlim=vlim,
+            contours=6,
+        )
+        ax.set_title(title, fontsize=12)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label=cbar_label)
+
+    pwr = "Relative " if relative else ""
+    note = (
+        f"{pwr}FFT band power — {str(band).lower()}  |  Montage: {used_montage}  |  "
+        f"source: {os.path.basename(csv_path)}"
+    )
+    if any_nan_note:
+        note += "  |  NaN replaced with median for display only."
+    fig.suptitle(note, fontsize=9, y=1.02)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"Saved: {out_path}")
+
+
+def _bands_in_csv(csv_path: str) -> List[str]:
+    df = pd.read_csv(csv_path)
+    if "band" not in df.columns:
+        raise SystemExit(f"CSV has no 'band' column. Columns: {list(df.columns)}")
+    return sorted(df["band"].astype(str).str.lower().unique().tolist())
+
+
+def _resolve_input_paths(args: argparse.Namespace) -> Tuple[str, str, Optional[str], bool, bool, str, str]:
+    """Resolve CSV/output/options from defaults + CLI with safety guards."""
+    if DEFAULT_CSV_PATH:
+        csv_path = DEFAULT_CSV_PATH
+        out_path = DEFAULT_OUT_PATH or "fft_bandpower_topomap_REST_MI_ME.png"
+        band_arg = None if DEFAULT_ALL_BANDS else DEFAULT_BAND
+        all_bands = DEFAULT_ALL_BANDS
+        relative = DEFAULT_RELATIVE
+        montage, cmap = DEFAULT_MONTAGE, DEFAULT_CMAP
+        # Allow CLI overrides for plotting options when default path is used.
+        if args.out:
+            out_path = args.out
+        if args.band is not None:
+            band_arg = args.band
+        if args.all_bands:
+            all_bands = True
+        if args.relative:
+            relative = True
+        if args.montage:
+            montage = args.montage
+        if args.cmap:
+            cmap = args.cmap
+    else:
+        csv_path = args.csv
+        out_path = args.out or "fft_bandpower_topomap_REST_MI_ME.png"
+        band_arg = args.band
+        all_bands = args.all_bands
+        relative = args.relative
+        montage = args.montage or "standard_1020"
+        cmap = args.cmap or "plasma"
+
+    if not csv_path:
+        raise SystemExit(
+            "Missing CSV path. Pass a file path as positional argument or set DEFAULT_CSV_PATH."
+        )
+    if str(csv_path).strip() in {"", "/path/to/file.csv", "/path/to/fft_bandpower_per_electrode_mean_across_subjects.csv"}:
+        raise SystemExit(
+            "CSV path is still a template placeholder. "
+            "Set a real path via CLI or DEFAULT_CSV_PATH."
+        )
+    csv_path = os.path.abspath(os.path.expanduser(str(csv_path)))
+    out_path = os.path.abspath(os.path.expanduser(str(out_path)))
+    return csv_path, out_path, band_arg, all_bands, relative, montage, cmap
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        description="Scalp topomaps from FFT band-power per-electrode CSV (REST / MI / ME)"
+    )
+    p.add_argument(
+        "csv",
+        nargs="?",
+        default=None,
+        help="Path to fft_bandpower_per_electrode_mean_across_subjects.csv",
+    )
+    p.add_argument(
+        "-o",
+        "--out",
+        default=None,
+        help="Output PNG path (default: fft_bandpower_topomap_REST_MI_ME.png in current directory)",
+    )
+    p.add_argument(
+        "--band",
+        default=None,
+        help="Frequency band label as in CSV (e.g. alpha, beta). Default: DEFAULT_BAND or first CSV band.",
+    )
+    p.add_argument(
+        "--all-bands",
+        action="store_true",
+        help="One PNG per band; -o base name gets _{band} inserted before extension",
+    )
+    p.add_argument(
+        "--relative",
+        action="store_true",
+        help="Use relative band power columns (bandpower_rel_*_mean) instead of absolute",
+    )
+    p.add_argument("--montage", default=None, help="Preferred MNE montage name")
+    p.add_argument("--cmap", default=None, help="Matplotlib colormap name (default: plasma)")
+    args = p.parse_args()
+
+    csv_path, out_path, band_arg, all_bands, relative, montage, cmap = _resolve_input_paths(args)
+    if not os.path.isfile(csv_path):
+        raise SystemExit(f"File not found: {csv_path}")
+    try:
+        plt.get_cmap(cmap)
+    except Exception as e:
+        raise SystemExit(f"Invalid matplotlib colormap {cmap!r}: {e}") from e
+    print(
+        "[INFO] plot_fft_bandpower_topomap_from_csv "
+        f"csv={csv_path!r} out={out_path!r} band={band_arg!r} all_bands={all_bands} "
+        f"relative={relative} montage={montage!r} cmap={cmap!r}"
+    )
+
+    if all_bands:
+        bands = _bands_in_csv(csv_path)
+        root, ext = os.path.splitext(out_path)
+        if not ext:
+            ext = ".png"
+        for b in bands:
+            outp = f"{root}_{b}{ext}"
+            plot_fft_bandpower_topomaps(
+                csv_path, outp, band=b, relative=relative, montage=montage, cmap=cmap
+            )
+        return
+
+    if band_arg is not None:
+        band = band_arg
+    elif DEFAULT_CSV_PATH:
+        band = DEFAULT_BAND
+    else:
+        bands = _bands_in_csv(csv_path)
+        band = bands[0] if bands else DEFAULT_BAND
+
+    plot_fft_bandpower_topomaps(
+        csv_path, out_path, band=band, relative=relative, montage=montage, cmap=cmap
+    )
+
+
+if __name__ == "__main__":
+    main()
