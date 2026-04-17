@@ -1,31 +1,26 @@
-# * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
-# EEG Motor Entropy Pipeline (Made for EEGMMIDB [PhysioNet] data)
+ ============================================================
+# EEG Motor Imagery — REST / MI / ME entropy pipeline (EEGMMIDB-style layout)
 #
-# Main conditions: Rest, Motor Imagery, and Motor Execution (movement)
+# SPDX-License-Identifier: MIT
 #
-# The pipeline includes multiple entropy measures:
-#  - Sample Entropy (SampEn)
-#  - Multiscale Entropy (MSE)
-#  - Permutation Entropy (PermEn)
-# Pipeline also calculates Power spectral density (PSD) using the fast Fourier transform (FFT) to compute band power
-# - Can compute absolute or relative band power
+# Intended for open-source use. Contains no credentials, paths, or host-specific data.
+# Point DATASET_ROOT at your local copy of the public EEG Motor Movement/Imagery dataset
+# (PhysioNet EEGMMIDB): https://physionet.org/content/eegmmidb/1.0.0/
+# Expected layout: DATASET_ROOT/S001/S001R01.edf, ... (see EDF_RUN_PATTERN).
 #
-# More Features of Pipeline
-# - Computes average sample entropy and band power for each electrode across subjects
-# - Produces CSV tables and figures of results (such as average sample entropy and multiscale entropy across subjects)
-# - Whole-scalp analysis, with an option to restrict analyses to sensorimotor + context ROI electrodes.
-# - Can also conduct antropy validation (requires pip install antropy)
+# What it computes
+# - ROI channel matching; Multiscale Entropy (MSE), Sample Entropy (SampEn),
+#   Permutation Entropy (PermEn, optional); default per-epoch then mean (ENTROPY_PER_EPOCH).
+# - CSVs, optional figures, per-electrode SampEn and Welch-based band power (absolute + relative).
+# - Optional FDR on MI vs ME p-values by MSE scale; optional antropy validation (pip install antropy).
 #
-# You may choose to not compute several of the mentioned measures in the configurations (set to True or False)
-# - You also have the option to compute entropy per epoch (recommended)
-#   or average epochs first and then compute entropy (faster computation time but more prone to inaccuracy)
+# Dependencies: Python 3.10+, mne, numpy, pandas, scipy, matplotlib, tqdm; optional joblib, antropy.
 #
-# REQUIRED: Python 3.10+, mne, numpy, pandas, scipy, matplotlib, tqdm; optional joblib, antropy
-#
-# Set DATASET_ROOT (below) before running; this is where the code will pull the data from
-# * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+# Configure: set DATASET_ROOT below, or set environment variable EEGMMIDB_ROOT before running
+# (see main()). Edit the CFG = Config() assignment block for run options.
+# ============================================================
 
-
+import argparse
 import os
 import re
 import math
@@ -38,6 +33,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+from scipy import signal as sp_signal
 from scipy.stats import ttest_rel
 
 import mne
@@ -117,7 +113,8 @@ class Config:
     SAMPEN_USE_ANTROPY: bool = True
     # Parallelize entropy across EEG channels (1 = off; -1 = all logical CPUs). Requires joblib.
     ENTROPY_N_JOBS: int = -1
-    # name, low_hz, high_hz (inclusive limits)
+    # name, low_hz, high_hz — integration uses half-open [lo, hi) between adjacent bands so
+    # shared edges (e.g. 4 Hz) are not double-counted; the final band is closed at hi.
     FFT_BANDS: List[Tuple[str, float, float]] = None
     # Relative band power = band integral / integral over [lo, hi] on same PSD (default: L_FREQ, H_FREQ)
     FFT_REL_POWER_DENOM_HZ: Optional[Tuple[float, float]] = None
@@ -177,9 +174,9 @@ CFG.ENTROPY_PER_EPOCH = True  # False: average epochs to one trace per channel b
 CFG.SAMPEN_USE_ANTROPY = True  # False: always use slow pure-Python SampEn
 CFG.ENTROPY_N_JOBS = -1  # 1 = no parallel; -1 = all CPUs (needs pip install joblib)
 CFG.PERMEN_DELAY = None  # None = auto (ACF first minimum); use 1 for consecutive-sample embedding
-# Set both False for a faster pilot (SampEn + FFT band power only).
-CFG.COMPUTE_PERMEN = True  # False: skip PermEn (subject CSV PermEn columns NaN)
-CFG.COMPUTE_MSE = True  # False: skip MSE curves and MI-vs-ME scale p-values
+# Fast default profile: SampEn + Welch band power only (relative/absolute band summaries in CSVs).
+CFG.COMPUTE_PERMEN = False
+CFG.COMPUTE_MSE = False
 CFG.FFT_BANDS = [
     ("delta", 1.0, 4.0),
     ("theta", 4.0, 8.0),
@@ -187,11 +184,13 @@ CFG.FFT_BANDS = [
     ("beta", 13.0, 30.0),
     ("gamma", 30.0, 40.0),
 ]
-CFG.APPLY_FDR_TO_MI_VS_ME_PVALS = True
-CFG.SAMPEN_VALIDATION_ENABLE = True
+CFG.APPLY_FDR_TO_MI_VS_ME_PVALS = False
+CFG.SAMPEN_VALIDATION_ENABLE = False
 CFG.SAMPEN_VALIDATION_SUBJECT_FRACTION = 0.08
 CFG.SAMPEN_VALIDATION_EXHAUSTIVE = False
-CFG.COMPUTE_ROI = True  # False: faster — no ROI summaries, figures, or ROI p-value columns
+CFG.COMPUTE_ROI = False
+CFG.MAKE_FIGURES = True
+CFG.SAVE_CAPTIONS = False
 
 CFG.ROI_ELECTRODES = [
     "FC3", "FC1", "FCz", "FC2", "FC4",
@@ -199,9 +198,6 @@ CFG.ROI_ELECTRODES = [
     "CP3", "CP1", "CPz", "CP2", "CP4",
     "O1", "Oz", "O2", "Pz"
 ]
-
-# Suppress EDF header runtime warnings that don't affect signal samples
-warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 # -----------------------------
 # Utility: subjects / paths
@@ -330,7 +326,10 @@ def load_and_preprocess_edf(path: str, cfg: Config) -> Optional[mne.io.BaseRaw]:
     if not os.path.exists(path):
         return None
     try:
-        raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
+        # Narrow scope: noisy EDF header parses emit RuntimeWarning; do not hide all NumPy/SciPy warnings globally.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
         raw.pick_types(eeg=True)  # legacy warning is OK; can change to raw.pick('eeg') later
         raw.filter(cfg.L_FREQ, cfg.H_FREQ, verbose=False)
         raw.set_eeg_reference(cfg.REF, verbose=False)
@@ -462,49 +461,89 @@ def subject_passes_inclusion(
             and nmi >= cfg.INCLUSION_MIN_EPOCHS_MI
             and nme >= cfg.INCLUSION_MIN_EPOCHS_ME
         )
-    return (nr > 0) or (nmi > 0) or (nme > 0)
+    # At least one condition meets its configured minimum (not merely non-empty).
+    return (
+        nr >= cfg.INCLUSION_MIN_EPOCHS_REST
+        or nmi >= cfg.INCLUSION_MIN_EPOCHS_MI
+        or nme >= cfg.INCLUSION_MIN_EPOCHS_ME
+    )
 
 
 # -----------------------------
 # Entropy functions
 # -----------------------------
-def sample_entropy(x: np.ndarray, m: int = 2, r: Optional[float] = None, r_frac: Optional[float] = None) -> float:
+def _sample_entropy_pure_python(x: np.ndarray, m: int, r: float) -> float:
     """
-    Sample Entropy (Richman–Moorman style, Chebyshev distance).
-    Uses antropy (fast) when CFG.SAMPEN_USE_ANTROPY and antropy is installed; else pure-Python O(N^2).
-    r_frac defaults to CFG.SAMPEN_R_FRAC when r is None.
+    Richman–Moorman sample entropy (Chebyshev distance), pure NumPy.
+    ``r`` must be a finite positive tolerance (same scaling as antropy when matched for validation).
     """
     x = np.asarray(x, dtype=float)
     x = x[np.isfinite(x)]
-    if x.size < (m + 2):
+    if x.size < (m + 2) or not np.isfinite(r) or r <= 0:
+        return np.nan
+    N = x.size
+
+    def _phi(mm: int) -> float:
+        xm = np.array([x[i : i + mm] for i in range(N - mm + 1)])
+        dist = np.max(np.abs(xm[:, None, :] - xm[None, :, :]), axis=2)
+        c_row = (dist <= r).sum(axis=0) - 1  # exclude self-match
+        return float(c_row.sum())
+
+    a = _phi(m + 1)
+    b = _phi(m)
+    if a <= 0 or b <= 0:
+        return np.nan
+    return float(-np.log(a / b))
+
+
+def sample_entropy(
+    x: np.ndarray,
+    cfg: Config,
+    m: Optional[int] = None,
+    r: Optional[float] = None,
+    r_frac: Optional[float] = None,
+    *,
+    force_custom: bool = False,
+) -> float:
+    """
+    Sample Entropy (Richman–Moorman, Chebyshev distance).
+
+    Uses ``cfg`` only (no module-global state): ``SAMPEN_USE_ANTROPY`` selects antropy when
+    installed and ``force_custom`` is False; otherwise the pure-Python implementation.
+
+    ``force_custom=True`` is for validation: compare Richman–Moorman vs antropy on identical (m, r).
+
+    Embedding dimension ``m`` defaults to ``cfg.SAMPEN_M``. When ``r`` is None, ``r = r_frac * SD(x)``
+    with ``r_frac`` from ``cfg.SAMPEN_R_FRAC`` unless overridden.
+    """
+    m_eff = int(cfg.SAMPEN_M if m is None else m)
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size < (m_eff + 2):
         return np.nan
 
     if r is None:
         sd = np.std(x)
         if not np.isfinite(sd) or sd == 0:
             return np.nan
-        frac = CFG.SAMPEN_R_FRAC if r_frac is None else r_frac
-        r = frac * sd
+        frac = float(cfg.SAMPEN_R_FRAC if r_frac is None else r_frac)
+        r_abs = frac * sd
+    else:
+        r_abs = float(r)
+        if not np.isfinite(r_abs) or r_abs <= 0:
+            return np.nan
 
-    if CFG.SAMPEN_USE_ANTROPY and _antropy_sample_entropy is not None:
+    if (
+        not force_custom
+        and cfg.SAMPEN_USE_ANTROPY
+        and _antropy_sample_entropy is not None
+    ):
         try:
-            return float(_antropy_sample_entropy(x, order=m, r=r))
+            return float(_antropy_sample_entropy(x, order=m_eff, r=r_abs))
         except Exception:
             pass
 
-    N = x.size
-
-    def _phi(mm: int) -> float:
-        xm = np.array([x[i:i + mm] for i in range(N - mm + 1)])
-        dist = np.max(np.abs(xm[:, None, :] - xm[None, :, :]), axis=2)
-        C = (dist <= r).sum(axis=0) - 1  # exclude self-match
-        return float(C.sum())
-
-    A = _phi(m + 1)
-    B = _phi(m)
-    if A <= 0 or B <= 0:
-        return np.nan
-    return float(-np.log(A / B))
+    return _sample_entropy_pure_python(x, m_eff, r_abs)
 
 def _perm_delay_autocorr_first_minimum(x: np.ndarray, max_lag: int) -> int:
     """
@@ -595,24 +634,30 @@ def permutation_entropy(x: np.ndarray, cfg: Config) -> float:
             pe = pe / max_pe
     return float(pe)
 
-def multiscale_entropy(x: np.ndarray, scales: int = 5, m: int = 2) -> np.ndarray:
+def multiscale_entropy(
+    x: np.ndarray,
+    cfg: Config,
+    scales: int = 5,
+    m: Optional[int] = None,
+) -> np.ndarray:
     """
     Coarse-grain by averaging non-overlapping windows of length s,
-    then compute SampEn at each scale. Recomputes r at each scale (via sd).
+    then compute SampEn at each scale. Recomputes r at each scale (via sd) using ``cfg``.
     """
+    m_eff = int(cfg.SAMPEN_M if m is None else m)
     x = np.asarray(x, dtype=float)
     x = x[np.isfinite(x)]
     if x.size < 50:
         return np.full(scales, np.nan)
 
-    out = []
+    out: List[float] = []
     for s in range(1, scales + 1):
         n = x.size // s
         if n < 50:
             out.append(np.nan)
             continue
-        y = np.mean(x[:n * s].reshape(n, s), axis=1)
-        out.append(sample_entropy(y, m=m, r=None, r_frac=CFG.SAMPEN_R_FRAC))
+        y = np.mean(x[: n * s].reshape(n, s), axis=1)
+        out.append(sample_entropy(y, cfg, m=m_eff, r=None, r_frac=cfg.SAMPEN_R_FRAC))
     return np.array(out, dtype=float)
 
 
@@ -637,10 +682,10 @@ def _channel_entropy_block(ch: int, all_ep: np.ndarray, cfg: Config) -> Tuple[np
         for e in range(n_ep):
             sig = all_ep[e, ch, :]
             if cfg.COMPUTE_MSE:
-                mse_rows.append(multiscale_entropy(sig, scales=cfg.MSE_SCALES, m=cfg.SAMPEN_M))
-            samp_vals.append(
-                sample_entropy(sig, m=cfg.SAMPEN_M, r=None, r_frac=cfg.SAMPEN_R_FRAC)
-            )
+                mse_rows.append(
+                    multiscale_entropy(sig, cfg, scales=cfg.MSE_SCALES, m=cfg.SAMPEN_M)
+                )
+            samp_vals.append(sample_entropy(sig, cfg, m=cfg.SAMPEN_M, r=None, r_frac=cfg.SAMPEN_R_FRAC))
             if cfg.COMPUTE_PERMEN:
                 perm_vals.append(permutation_entropy(sig, cfg))
         if cfg.COMPUTE_MSE and mse_rows:
@@ -654,9 +699,9 @@ def _channel_entropy_block(ch: int, all_ep: np.ndarray, cfg: Config) -> Tuple[np
             perm_ch = np.nan
     else:
         sig = all_ep.mean(axis=0)[ch, :]
-        samp_ch = sample_entropy(sig, m=cfg.SAMPEN_M, r=None, r_frac=cfg.SAMPEN_R_FRAC)
+        samp_ch = sample_entropy(sig, cfg, m=cfg.SAMPEN_M, r=None, r_frac=cfg.SAMPEN_R_FRAC)
         if cfg.COMPUTE_MSE:
-            mse_ch_row = multiscale_entropy(sig, scales=cfg.MSE_SCALES, m=cfg.SAMPEN_M)
+            mse_ch_row = multiscale_entropy(sig, cfg, scales=cfg.MSE_SCALES, m=cfg.SAMPEN_M)
         else:
             mse_ch_row = np.full(cfg.MSE_SCALES, np.nan)
         perm_ch = permutation_entropy(sig, cfg) if cfg.COMPUTE_PERMEN else np.nan
@@ -666,12 +711,12 @@ def _channel_entropy_block(ch: int, all_ep: np.ndarray, cfg: Config) -> Tuple[np
 def _sampen_per_ch_one(ch: int, all_ep: np.ndarray, cfg: Config) -> float:
     if cfg.ENTROPY_PER_EPOCH:
         vals = [
-            sample_entropy(all_ep[e, ch, :], m=cfg.SAMPEN_M, r=None, r_frac=cfg.SAMPEN_R_FRAC)
+            sample_entropy(all_ep[e, ch, :], cfg, m=cfg.SAMPEN_M, r=None, r_frac=cfg.SAMPEN_R_FRAC)
             for e in range(all_ep.shape[0])
         ]
         return float(np.nanmean(vals))
     sig = all_ep.mean(axis=0)[ch, :]
-    return float(sample_entropy(sig, m=cfg.SAMPEN_M, r=None, r_frac=cfg.SAMPEN_R_FRAC))
+    return float(sample_entropy(sig, cfg, m=cfg.SAMPEN_M, r=None, r_frac=cfg.SAMPEN_R_FRAC))
 
 
 def sample_entropy_per_channel_from_epochs(
@@ -720,17 +765,28 @@ def fft_bandpower_per_channel_from_epochs(
     cfg: Config,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Compute FFT band power per channel from condition-averaged signal (one rfft per channel).
-    Returns (absolute, relative) each shape (n_ch, n_bands).
-    Relative = band power / integral of PSD over the denominator band (default: L_FREQ–H_FREQ).
+    Band-limited power from **Welch** spectral density estimates.
+
+    For each channel, a one-segment Welch PSD is computed **per epoch** (window = full epoch,
+    Hann window), PSDs are averaged across epochs, then integrated over frequency for each
+    band. This avoids phase-cancellation artifacts from averaging the time-domain signal before
+    spectral analysis.
+
+    Adjacent bands use half-open intervals ``[lo, hi)`` so shared edges (e.g. 4 Hz) are not
+    double-counted; the **last** band uses ``[lo, hi]`` closed at ``hi``.
+
+    Returns (absolute, relative) each shape (n_ch, n_bands). Absolute columns are
+    :math:`\\int S(f)\\,df` in each band (``scaling='density'``: V²/Hz × Hz). Relative =
+    band integral / integral of the same Welch PSD over the denominator band
+    (``FFT_REL_POWER_DENOM_HZ`` or L_FREQ–H_FREQ).
     """
     n_b = len(cfg.FFT_BANDS)
     if not epochs or not ch_names or sfreq is None or sfreq <= 0:
         return np.array([]), np.array([])
 
     all_ep = np.stack(epochs, axis=0)
-    avg = all_ep.mean(axis=0)  # (n_ch, n_samp)
-    n_ch_data, n_ch_names = avg.shape[0], len(ch_names)
+    n_ep, n_ch_data, n_samp = all_ep.shape
+    n_ch_names = len(ch_names)
     if n_ch_data != n_ch_names:
         print(
             f"[WARN] Channel count mismatch (data={n_ch_data}, names={n_ch_names}); "
@@ -739,37 +795,57 @@ def fft_bandpower_per_channel_from_epochs(
         nan2 = np.full((n_ch_names, n_b), np.nan, dtype=float)
         return nan2, nan2
 
-    n_samp = avg.shape[1]
-    if n_samp < 4:
+    if n_samp < 8:
         nan2 = np.full((n_ch_data, n_b), np.nan, dtype=float)
         return nan2, nan2
 
-    freqs = np.fft.rfftfreq(n_samp, d=1.0 / float(sfreq))
+    fs = float(sfreq)
+    n_bands = len(cfg.FFT_BANDS)
     d_lo, d_hi = _fft_rel_power_denom_hz(cfg)
-    denom_mask = (freqs >= d_lo) & (freqs <= d_hi)
 
     out_abs = np.full((n_ch_data, n_b), np.nan, dtype=float)
     out_rel = np.full((n_ch_data, n_b), np.nan, dtype=float)
 
     for ch in range(n_ch_data):
-        sig = avg[ch]
-        if not np.all(np.isfinite(sig)):
-            sig = np.nan_to_num(sig, nan=0.0)
-        sig = sig - np.mean(sig)
-        fft_vals = np.fft.rfft(sig)
-        psd = (np.abs(fft_vals) ** 2) / max(n_samp, 1)
+        psd_stack: List[np.ndarray] = []
+        freqs: Optional[np.ndarray] = None
+        for e in range(n_ep):
+            sig = all_ep[e, ch, :].astype(float)
+            if not np.all(np.isfinite(sig)):
+                sig = np.nan_to_num(sig, nan=0.0)
+            sig = sig - np.mean(sig)
+            freqs_w, pxx = sp_signal.welch(
+                sig,
+                fs=fs,
+                nperseg=n_samp,
+                noverlap=0,
+                window="hann",
+                scaling="density",
+                detrend=False,
+            )
+            if freqs is None:
+                freqs = freqs_w
+            psd_stack.append(pxx)
+        if not psd_stack or freqs is None:
+            continue
+        mean_psd = np.mean(np.stack(psd_stack, axis=0), axis=0)
+        f = freqs
 
+        denom_mask = (f >= d_lo) & (f <= d_hi)
         if np.count_nonzero(denom_mask) < 2:
             total_pow = np.nan
         else:
-            total_pow = float(np.trapz(psd[denom_mask], freqs[denom_mask]))
+            total_pow = float(np.trapz(mean_psd[denom_mask], f[denom_mask]))
         use_rel = np.isfinite(total_pow) and total_pow > 0
 
         for b_idx, (_band_name, lo, hi) in enumerate(cfg.FFT_BANDS):
-            mask = (freqs >= lo) & (freqs <= hi)
+            if b_idx < n_bands - 1:
+                mask = (f >= lo) & (f < hi)
+            else:
+                mask = (f >= lo) & (f <= hi)
             if np.count_nonzero(mask) < 2:
                 continue
-            band_pow = float(np.trapz(psd[mask], freqs[mask]))
+            band_pow = float(np.trapz(mean_psd[mask], f[mask]))
             out_abs[ch, b_idx] = band_pow
             if use_rel and np.isfinite(band_pow):
                 out_rel[ch, b_idx] = band_pow / total_pow
@@ -939,7 +1015,11 @@ def collect_sampen_antropy_validation(
     rng: np.random.Generator,
 ) -> List[Dict[str, object]]:
     """
-    Compare custom SampEn vs antropy on random epochs/channels (low overhead).
+    Compare **pure Richman–Moorman** SampEn vs **antropy** on random epochs/channels (low overhead).
+
+    The main pipeline may use antropy for speed when ``SAMPEN_USE_ANTROPY`` is True; this check
+    always computes the pure-Python path (``force_custom``) for the first column so the CSV is
+    a meaningful agreement probe, not antropy-vs-antropy.
     """
     rows: List[Dict[str, object]] = []
     if not cfg.SAMPEN_VALIDATION_ENABLE or _antropy_sample_entropy is None:
@@ -971,7 +1051,12 @@ def collect_sampen_antropy_validation(
             for ch in ch_idx:
                 sig = all_ep[e, ch, :]
                 c = sample_entropy(
-                    sig, m=cfg.SAMPEN_M, r=None, r_frac=cfg.SAMPEN_R_FRAC
+                    sig,
+                    cfg,
+                    m=cfg.SAMPEN_M,
+                    r=None,
+                    r_frac=cfg.SAMPEN_R_FRAC,
+                    force_custom=True,
                 )
                 a = antropy_sample_entropy_match_cfg(sig, cfg)
                 ad = np.nan
@@ -983,7 +1068,7 @@ def collect_sampen_antropy_validation(
                     "epoch_index": int(e),
                     "channel_index": int(ch),
                     "channel_name": ch_names[ch],
-                    "sampen_custom": c,
+                    "sampen_pure_richman": c,
                     "sampen_antropy": a,
                     "abs_diff": ad,
                 })
@@ -1035,6 +1120,35 @@ def aggregate_sampen_by_electrode(
                 "sampen_sem": float(sem(finite)) if n_sub > 1 else (0.0 if n_sub == 1 else np.nan),
             })
 
+    return pd.DataFrame(rows)
+
+
+def aggregate_sampen_by_electrode_by_subject(
+    per_subject: List[Tuple[str, List[str], np.ndarray, np.ndarray, np.ndarray]],
+) -> pd.DataFrame:
+    """
+    One row per (subject, electrode): SampEn for REST / MI / ME at that channel.
+    Used for custom ROI subsets (e.g. sensorimotor cortex only) in offline stats scripts.
+    """
+    rows: List[Dict[str, object]] = []
+    for subj, names, sr, smi, sme in per_subject:
+        if not names or sr.size == 0:
+            continue
+        n = min(len(names), sr.size, smi.size, sme.size)
+        for i in range(n):
+            key = _norm_ch_name(names[i])
+            if not key:
+                continue
+            rows.append(
+                {
+                    "subject": subj,
+                    "channel_norm": key,
+                    "channel": names[i],
+                    "sampen_rest": float(sr[i]),
+                    "sampen_mi": float(smi[i]),
+                    "sampen_me": float(sme[i]),
+                }
+            )
     return pd.DataFrame(rows)
 
 
@@ -1488,6 +1602,11 @@ def run_pipeline(cfg: Config) -> Dict[str, object]:
         )
         df_e_wide = sampen_per_electrode_wide_csv(df_e_long)
         df_e_wide.to_csv(os.path.join(out_dir, cfg.SAMPEN_PER_ELECTRODE_CSV_NAME), index=False)
+        df_e_subj = aggregate_sampen_by_electrode_by_subject(per_subject_sampen_by_ch)
+        df_e_subj.to_csv(
+            os.path.join(out_dir, "sampen_per_electrode_by_subject_wide.csv"),
+            index=False,
+        )
 
     # Per-electrode FFT band power: long + wide CSVs
     if cfg.SAVE_FFT_BANDPOWER_PER_ELECTRODE_CSV and per_subject_fft_bandpower_by_ch:
@@ -1577,7 +1696,7 @@ def run_pipeline(cfg: Config) -> Dict[str, object]:
         ad = ad[np.isfinite(ad)]
         if ad.size:
             print(
-                f"\n=== SampEn validation (antropy vs custom, n={ad.size}) ===\n"
+                f"\n=== SampEn validation (antropy vs pure Richman–Moorman, n={ad.size}) ===\n"
                 f"  mean |diff| = {float(np.mean(ad)):.6g}; max |diff| = {float(np.max(ad)):.6g}"
             )
 
@@ -1650,17 +1769,125 @@ def run_pipeline(cfg: Config) -> Dict[str, object]:
         "roi_missing": roi_missing_ref,
     }
 
+
+def export_sampen_per_electrode_by_subject_only(
+    cfg: Config,
+    out_path: Optional[str] = None,
+) -> str:
+    """
+    Lightweight path: recompute **only** per-electrode Sample Entropy (REST / MI / ME) per
+    subject and write ``sampen_per_electrode_by_subject_wide.csv``.
+
+    Does **not** run MSE curves, FFT band power, figures, ``subject_summary.csv``, or other
+    pipeline outputs — only the same ``entropy_per_channel_from_epochs`` SampEn vectors used
+    in the full pipeline, then aggregates with ``aggregate_sampen_by_electrode_by_subject``.
+
+    Use this when you already have group-level CSVs but need per-subject × electrode data
+    for custom electrode subsets (e.g. sensorimotor cortex stats) without re-running the
+    entire pipeline.
+
+    Parameters
+    ----------
+    cfg
+        Same ``Config`` as ``run_pipeline`` (``DATASET_ROOT``, subject range, inclusion, etc.).
+    out_path
+        Full path to the CSV. If ``None``, writes under ``DATASET_ROOT / OUT_DIR_NAME /
+        sampen_per_electrode_by_subject_wide.csv``.
+
+    Returns
+    -------
+    str
+        Path written.
+    """
+    subs = subject_ids(cfg)
+    per_subject_sampen_by_ch: List[Tuple[str, List[str], np.ndarray, np.ndarray, np.ndarray]] = []
+    for subj in tqdm(subs, desc="Subjects (SampEn per-electrode export only)"):
+        rest_epochs, mi_epochs, me_epochs, subj_ch_names, _subj_sfreq = load_subject_epochs(cfg, subj)
+        if (len(rest_epochs) == 0) and (len(mi_epochs) == 0) and (len(me_epochs) == 0):
+            continue
+        if cfg.INCLUSION_ENABLE and not subject_passes_inclusion(rest_epochs, mi_epochs, me_epochs, cfg):
+            continue
+
+        _, samp_r_ch, _ = entropy_per_channel_from_epochs(rest_epochs, cfg)
+        _, samp_mi_ch, _ = entropy_per_channel_from_epochs(mi_epochs, cfg)
+        _, samp_me_ch, _ = entropy_per_channel_from_epochs(me_epochs, cfg)
+
+        if subj_ch_names:
+            n_ch = len(subj_ch_names)
+            sr_ch = samp_r_ch if samp_r_ch.size == n_ch else np.full(n_ch, np.nan)
+            smi_ch = samp_mi_ch if samp_mi_ch.size == n_ch else np.full(n_ch, np.nan)
+            sme_ch = samp_me_ch if samp_me_ch.size == n_ch else np.full(n_ch, np.nan)
+        else:
+            sr_ch = smi_ch = sme_ch = np.array([])
+
+        if subj_ch_names and sr_ch.size == len(subj_ch_names):
+            per_subject_sampen_by_ch.append((subj, list(subj_ch_names), sr_ch, smi_ch, sme_ch))
+
+    df = aggregate_sampen_by_electrode_by_subject(per_subject_sampen_by_ch)
+    if out_path is None:
+        out_dir = os.path.join(cfg.DATASET_ROOT, cfg.OUT_DIR_NAME)
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "sampen_per_electrode_by_subject_wide.csv")
+    else:
+        out_path = os.path.abspath(out_path)
+        d = os.path.dirname(out_path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+    df.to_csv(out_path, index=False)
+    print(f"[export_sampen_per_electrode_by_subject_only] Wrote {len(df)} rows -> {out_path}")
+    return out_path
+
+
 def main() -> None:
-    # Optional: export EEGMMIDB_ROOT=/your/path before running so you do not edit the file.
-    root = os.environ.get("EEGMMIDB_ROOT", "").strip()
+    parser = argparse.ArgumentParser(
+        description=(
+            "EEGMMIDB entropy pipeline (REST/MI/ME). "
+            "Configure via CLI args, environment (EEGMMIDB_ROOT), or CFG defaults."
+        )
+    )
+    parser.add_argument(
+        "--dataset-root",
+        type=str,
+        default=None,
+        help=(
+            "Path to local EEGMMIDB root. "
+            "Overrides EEGMMIDB_ROOT env and CFG.DATASET_ROOT."
+        ),
+    )
+    parser.add_argument(
+        "--out-dir-name",
+        type=str,
+        default=None,
+        help="Override output folder name under dataset root (default from CFG.OUT_DIR_NAME).",
+    )
+    args = parser.parse_args()
+
+    # Priority: CLI --dataset-root > EEGMMIDB_ROOT env > CFG default in file
+    root = (args.dataset_root or os.environ.get("EEGMMIDB_ROOT", "")).strip()
     if root:
         CFG.DATASET_ROOT = root
+    if args.out_dir_name:
+        CFG.OUT_DIR_NAME = str(args.out_dir_name).strip()
+
+    # Safety guard for public template usage.
+    if CFG.DATASET_ROOT.strip() in {"", "/path/to/EEGMMIDB"}:
+        raise ValueError(
+            "DATASET_ROOT is still a template path. "
+            "Set --dataset-root, or export EEGMMIDB_ROOT, or edit CFG.DATASET_ROOT."
+        )
     if not os.path.isdir(CFG.DATASET_ROOT):
         raise ValueError(
             f"DATASET_ROOT is not a directory: {CFG.DATASET_ROOT!r}\n"
             "Set Config.DATASET_ROOT to your EEGMMIDB folder, or set the EEGMMIDB_ROOT environment variable."
         )
+    print(
+        "[INFO] Run config: "
+        f"dataset_root={CFG.DATASET_ROOT!r}, out_dir_name={CFG.OUT_DIR_NAME!r}, "
+        f"subjects={CFG.SUBJECT_RANGE}, sample_n={CFG.SUBJECT_SAMPLE_N}, "
+        f"sample_fraction={CFG.SUBJECT_SAMPLE_FRACTION}"
+    )
     run_pipeline(CFG)
 
 if __name__ == "__main__":
     main()
+
