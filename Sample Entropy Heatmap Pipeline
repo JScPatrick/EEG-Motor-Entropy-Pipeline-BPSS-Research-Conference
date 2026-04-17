@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""
+Plot Sample Entropy per-electrode scalp maps from an existing pipeline CSV.
+Does NOT re-run the full EEG pipeline.
+
+Input: wide CSV produced as sampen_per_electrode_mean_across_subjects.csv
+       (columns include channel, sampen_rest_mean, sampen_mi_mean, sampen_me_mean)
+
+Usage:
+  python plot_sampen_topomap_from_csv.py /path/to/sampen_per_electrode_mean_across_subjects.csv
+  python plot_sampen_topomap_from_csv.py --csv /path/to/file.csv -o my_topomap.png
+
+Or: set DEFAULT_CSV_PATH and DEFAULT_OUT_PATH below and run from PyCharm (no CLI args).
+
+Requires: mne, matplotlib, pandas, numpy (same env as your pipeline).
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from typing import List, Optional, Tuple
+
+# =============================================================================
+# EDIT HERE (optional): set paths to run with PyCharm "Run" without CLI arguments.
+# Leave DEFAULT_CSV_PATH as None to use command-line arguments instead.
+# =============================================================================
+DEFAULT_CSV_PATH: Optional[str] = None  # e.g. r"/path/to/entropy_results_.../sampen_per_electrode_mean_across_subjects.csv"
+DEFAULT_OUT_PATH: Optional[str] = None  # e.g. r"/path/to/sampen_topomap_REST_MI_ME.png" (defaults to PNG in cwd if None)
+DEFAULT_MONTAGE: str = "standard_1020"
+DEFAULT_CMAP: str = "plasma"
+
+import matplotlib.pyplot as plt
+import mne
+import numpy as np
+import pandas as pd
+
+# Fallback order if your preferred montage does not match channel names
+MONTAGE_CANDIDATES = ("standard_1020", "biosemi64", "standard_1005")
+
+
+def _norm_ch_key(name: str) -> str:
+    """
+    Same idea as eeg_mmidb_entropy_pipeline._norm_ch_name: uppercase, strip spaces,
+    remove punctuation so CSV labels like 'Af3.' / 'C1..' match montage 'AF3' / 'C1'.
+    """
+    if name is None:
+        return ""
+    x = str(name).strip().upper()
+    x = re.sub(r"[\s\.\-_/]", "", x)
+    return x
+
+
+def _pick_montage_and_canonical_names(
+    raw_names: List[str], preference: str
+) -> Tuple[mne.channels.DigMontage, str, List[str]]:
+    """
+    Map messy CSV channel strings to exact montage labels so set_montage() assigns positions.
+    Tries `preference` first, then MONTAGE_CANDIDATES.
+    """
+    order = ([preference] if preference else []) + [
+        m for m in MONTAGE_CANDIDATES if m != preference
+    ]
+    tried: List[str] = []
+    best: Tuple[int, str, mne.channels.DigMontage, List[str], List[str]] | None = None
+    for montage_name in order:
+        if montage_name in tried:
+            continue
+        tried.append(montage_name)
+        try:
+            montage = mne.channels.make_standard_montage(montage_name)
+        except Exception:
+            continue
+        lookup = {_norm_ch_key(ch): ch for ch in montage.ch_names}
+        canonical: List[str] = []
+        missing: List[str] = []
+        for r in raw_names:
+            k = _norm_ch_key(r)
+            if k in lookup:
+                canonical.append(lookup[k])
+            else:
+                canonical.append(str(r))
+                missing.append(r)
+        n_ok = len(raw_names) - len(missing)
+        if best is None or n_ok > best[0]:
+            best = (n_ok, montage_name, montage, canonical, missing)
+        if not missing:
+            return montage, montage_name, canonical
+
+    assert best is not None
+    n_ok, montage_name, montage, canonical, missing = best
+    if missing:
+        sample = ", ".join(repr(x) for x in missing[:8])
+        raise RuntimeError(
+            "Could not map all CSV channel names to a standard montage after normalizing "
+            "(strip dots/punctuation; same rules as the main pipeline's _norm_ch_name). "
+            f"Montage {montage_name!r} matched {n_ok}/{len(raw_names)} channels. "
+            f"Unmapped examples: {sample}. "
+            "Fix the 'channel' column in the CSV or extend _norm_ch_key / try --montage biosemi64."
+        )
+    return montage, montage_name, canonical
+
+
+def _apply_montage(
+    info: mne.Info, montage: mne.channels.DigMontage, montage_name: str
+) -> Tuple[mne.Info, str]:
+    raw = mne.io.RawArray(np.zeros((info["nchan"], 100)), info.copy())
+    raw.set_montage(montage, match_case=False, on_missing="raise")
+    return raw.info, montage_name
+
+
+def _finite_topomap_data(values: np.ndarray) -> Tuple[np.ndarray, bool]:
+    """Replace NaN with median for plotting only (returns flag if any NaN)."""
+    had_nan = bool(np.any(~np.isfinite(values)))
+    v = values.astype(float).copy()
+    med = float(np.nanmedian(v))
+    if not np.isfinite(med):
+        med = 0.0
+    v[~np.isfinite(v)] = med
+    return v, had_nan
+
+
+def plot_sampen_topomaps(
+    csv_path: str,
+    out_path: str,
+    montage: str = "standard_1020",
+    cmap: str = "plasma",
+) -> None:
+    df = pd.read_csv(csv_path)
+    # Prefer channel_norm (e.g. AF3) over channel display labels (e.g. Af3.) for montage matching.
+    if "channel_norm" in df.columns:
+        ch_col = "channel_norm"
+    elif "channel" in df.columns:
+        ch_col = "channel"
+    else:
+        raise SystemExit(f"Need 'channel' or 'channel_norm'. Columns: {list(df.columns)}")
+    req = ["sampen_rest_mean", "sampen_mi_mean", "sampen_me_mean"]
+    for c in req:
+        if c not in df.columns:
+            raise SystemExit(
+                f"Missing column {c!r}. Use the WIDE file sampen_per_electrode_mean_across_subjects.csv "
+                f"from the pipeline output folder. Columns found: {list(df.columns)}"
+            )
+
+    raw_names = df[ch_col].astype(str).str.strip().tolist()
+    montage_obj, used_montage, canonical_names = _pick_montage_and_canonical_names(
+        raw_names, montage
+    )
+    if len(set(canonical_names)) != len(canonical_names):
+        raise RuntimeError(
+            "After normalizing names, some channels map to the same montage electrode. "
+            f"Check duplicate rows or ambiguous labels. Names: {canonical_names!r}"
+        )
+    info = mne.create_info(canonical_names, sfreq=256.0, ch_types="eeg")
+    info, used_montage = _apply_montage(info, montage_obj, used_montage)
+
+    conditions = [
+        ("REST", "sampen_rest_mean"),
+        ("MI", "sampen_mi_mean"),
+        ("ME", "sampen_me_mean"),
+    ]
+
+    # Shared color scale across REST / MI / ME for comparability
+    stacked = np.concatenate(
+        [pd.to_numeric(df[c], errors="coerce").to_numpy(dtype=float) for _, c in conditions]
+    )
+    g_min, g_max = float(np.nanmin(stacked)), float(np.nanmax(stacked))
+    if not np.isfinite(g_min) or not np.isfinite(g_max) or g_min == g_max:
+        vlim = None
+    else:
+        vlim = (g_min, g_max)
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+    any_nan_note = False
+    for ax, (title, col) in zip(axes, conditions):
+        raw_vals = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+        plot_vals, had_nan = _finite_topomap_data(raw_vals)
+        any_nan_note = any_nan_note or had_nan
+
+        im, _ = mne.viz.plot_topomap(
+            plot_vals,
+            info,
+            axes=ax,
+            show=False,
+            cmap=cmap,
+            vlim=vlim,
+            contours=6,
+        )
+        ax.set_title(title, fontsize=12)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="SampEn (mean)")
+
+    note = f"Montage: {used_montage}  |  source: {os.path.basename(csv_path)}"
+    if any_nan_note:
+        note += "  |  NaN channel values replaced with median for display only."
+    fig.suptitle(note, fontsize=9, y=1.02)
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"Saved: {out_path}")
+
+
+def _resolve_input_paths(args: argparse.Namespace) -> Tuple[str, str, str, str]:
+    """Resolve CSV/output/montage/cmap from defaults + CLI with safety guards."""
+    if DEFAULT_CSV_PATH:
+        csv_path = DEFAULT_CSV_PATH
+        out_path = DEFAULT_OUT_PATH or "sampen_topomap_REST_MI_ME.png"
+        montage, cmap = DEFAULT_MONTAGE, DEFAULT_CMAP
+        # Allow overriding non-sensitive plotting choices from CLI when default path is used.
+        if args.out:
+            out_path = args.out
+        if args.montage:
+            montage = args.montage
+        if args.cmap:
+            cmap = args.cmap
+    else:
+        csv_path = args.csv
+        out_path = args.out or "sampen_topomap_REST_MI_ME.png"
+        montage = args.montage or "standard_1020"
+        cmap = args.cmap or "plasma"
+
+    if not csv_path:
+        raise SystemExit(
+            "Missing CSV path. Pass a file path as positional argument or set DEFAULT_CSV_PATH."
+        )
+    if str(csv_path).strip() in {"", "/path/to/file.csv", "/path/to/sampen_per_electrode_mean_across_subjects.csv"}:
+        raise SystemExit(
+            "CSV path is still a template placeholder. "
+            "Set a real path via CLI or DEFAULT_CSV_PATH."
+        )
+    csv_path = os.path.abspath(os.path.expanduser(str(csv_path)))
+    out_path = os.path.abspath(os.path.expanduser(str(out_path)))
+    return csv_path, out_path, montage, cmap
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Scalp topomaps from SampEn per-electrode CSV")
+    p.add_argument(
+        "csv",
+        nargs="?",
+        default=None,
+        help="Path to sampen_per_electrode_mean_across_subjects.csv",
+    )
+    p.add_argument(
+        "-o",
+        "--out",
+        default=None,
+        help="Output PNG path (default: sampen_topomap_REST_MI_ME.png in current directory)",
+    )
+    p.add_argument(
+        "--montage",
+        default="standard_1020",
+        help="Preferred MNE montage name (tries others if needed)",
+    )
+    p.add_argument("--cmap", default=None, help="Matplotlib colormap name (default: plasma)")
+    args = p.parse_args()
+
+    csv_path, out_path, montage, cmap = _resolve_input_paths(args)
+    if not os.path.isfile(csv_path):
+        raise SystemExit(f"File not found: {csv_path}")
+    try:
+        plt.get_cmap(cmap)
+    except Exception as e:
+        raise SystemExit(f"Invalid matplotlib colormap {cmap!r}: {e}") from e
+
+    print(
+        "[INFO] plot_sampen_topomap_from_csv "
+        f"csv={csv_path!r} out={out_path!r} montage={montage!r} cmap={cmap!r}"
+    )
+
+    plot_sampen_topomaps(csv_path, out_path, montage=montage, cmap=cmap)
+
+
+if __name__ == "__main__":
+    main()
